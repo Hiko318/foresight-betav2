@@ -1,0 +1,5 @@
+names:
+  0: person
+path: training_data\yolo_dataset
+train: images/train
+val: images/train

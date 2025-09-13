@@ -1,0 +1,22 @@
+{
+  "timestamp": "20250910_060040_603431",
+  "frame_path": "training_data\\positive\\frame_20250910_060040_603431.jpg",
+  "detections": [
+    [
+      {
+        "box": [
+          93,
+          63,
+          514,
+          409
+        ],
+        "confidence": 0.9416748285293579,
+        "label": "Person 0.94",
+        "class_id": 0
+      },
+      1.0,
+      "positive"
+    ]
+  ],
+  "label_type": "positive"
+}

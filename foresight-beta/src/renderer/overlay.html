@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Argus Overlay</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            overflow: hidden;
+            pointer-events: none;
+        }
+        
+        #overlay-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="overlay-canvas"></canvas>
+    <script>
+        // ChatGPT anti-flicker implementation: Canvas with requestAnimationFrame
+        const canvas = document.getElementById('overlay-canvas');
+        const ctx = canvas.getContext('2d');
+        
+        // ChatGPT recommendation: Store detections in ref-like structure
+        let currentDetections = [];
+        let animationId = null;
+        
+        // Fixed YOLO region coordinates
+        const targetRegionX = 139;
+        const targetRegionY = 119;
+        const targetRegionWidth = 1498;
+        const targetRegionHeight = 936;
+        
+        // Set canvas size to match window
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+        
+        // ChatGPT recommendation: Draw function with requestAnimationFrame
+        function drawDetections() {
+            // Clear canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // No interactive controls needed - using fixed coordinates
+            
+            // Draw current detections
+            if (currentDetections && currentDetections.length > 0) {
+                ctx.strokeStyle = '#00ff00';
+                ctx.lineWidth = 2;
+                ctx.fillStyle = '#00ff00';
+                ctx.font = '14px Arial';
+                
+                currentDetections.forEach(detection => {
+                    // Handle both old format (coords array) and new format (x1, y1, x2, y2)
+                    let x1, y1, x2, y2;
+                    if (detection.coords && detection.coords.length >= 4) {
+                        [x1, y1, x2, y2] = detection.coords;
+                    } else if (detection.x1 !== undefined) {
+                        x1 = detection.x1;
+                        y1 = detection.y1;
+                        x2 = detection.x2;
+                        y2 = detection.y2;
+                    } else {
+                        return; // Skip invalid detection
+                    }
+                    
+                    // Transform coordinates from YOLO desktop capture to specific region
+                    // YOLO captures the entire desktop but we want to map to specific region:
+                    // Top-left (x, y): (1, 128)
+                    // Bottom-right (x, y): (1498, 1064)
+                    // Width × Height: 1498 × 937
+                    
+                    // Use dynamic target region coordinates
+                    // (these can be adjusted with keyboard controls)
+                    
+                    // Map YOLO desktop coordinates to the target region
+                    // First, check if detection is within our target region
+                    if (x1 >= targetRegionX && y1 >= targetRegionY && 
+                        x2 <= targetRegionX + targetRegionWidth && 
+                        y2 <= targetRegionY + targetRegionHeight) {
+                        
+                        // Convert desktop coordinates to region-relative coordinates
+                        x1 = x1 - targetRegionX;
+                        y1 = y1 - targetRegionY;
+                        x2 = x2 - targetRegionX;
+                        y2 = y2 - targetRegionY;
+                        
+                        // Scale to overlay canvas size
+                        const scaleX = canvas.width / targetRegionWidth;
+                        const scaleY = canvas.height / targetRegionHeight;
+                        
+                        x1 = x1 * scaleX;
+                        y1 = y1 * scaleY;
+                        x2 = x2 * scaleX;
+                        y2 = y2 * scaleY;
+                    } else {
+                        // Skip detections outside our target region
+                        return;
+                    }
+                    
+                    // Only draw if coordinates are within content area
+                    if (x1 >= 0 && y1 >= 0 && x2 <= canvas.width && y2 <= canvas.height) {
+                        // Draw bounding box
+                        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                        
+                        // Draw label
+                        const confidence = detection.confidence || detection.conf || 0;
+                        const label = `Person ${confidence.toFixed(2)}`;
+                        const textMetrics = ctx.measureText(label);
+                        const textHeight = 16;
+                        
+                        // Background for text
+                        ctx.fillStyle = '#00ff00';
+                        ctx.fillRect(x1, y1 - textHeight - 2, textMetrics.width + 4, textHeight + 2);
+                        
+                        // Text
+                        ctx.fillStyle = '#000000';
+                        ctx.fillText(label, x1 + 2, y1 - 4);
+                        
+                        // Reset fill style for next box
+                        ctx.fillStyle = '#00ff00';
+                    }
+                });
+            }
+            
+            // Continue animation loop
+            animationId = requestAnimationFrame(drawDetections);
+        }
+        
+        // Start the animation loop
+        animationId = requestAnimationFrame(drawDetections);
+        
+        // Listen for detection updates from main process
+        window.electronAPI?.onDetectionUpdate?.((detections) => {
+            currentDetections = detections || [];
+        });
+        
+        // Also listen for YOLO detections from the new system
+        if (window.require) {
+            const { ipcRenderer } = window.require('electron');
+            ipcRenderer.on('yolo-detections', (event, detections) => {
+                currentDetections = detections || [];
+            });
+        }
+        
+        // Control instructions removed - using fixed coordinates
+        
+        // All interactive controls removed - using fixed coordinates
+        // Overlay now uses pointer-events: none for better performance
+        document.body.style.pointerEvents = 'none';
+        
+        // Cleanup on window close
+        window.addEventListener('beforeunload', () => {
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+        });
+    </script>
+</body>
+</html>

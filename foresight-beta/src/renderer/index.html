@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Argus</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon">🔮</div>
+                <h1>ARGUS</h1>
+            </div>
+            <div class="header-controls">
+                <button id="startCapture" class="btn btn-success">Start Capture</button>
+                <button id="stopCapture" class="btn btn-danger" disabled>Stop Capture</button>
+                <button id="testDisplay" class="btn btn-info">Test Display</button>
+                <div class="sar-toggle">
+                    <label class="toggle-label">SAR Mode</label>
+                    <div class="toggle-switch">
+                        <input type="checkbox" id="sarMode" class="toggle-input">
+                        <label for="sarMode" class="toggle-slider"></label>
+                    </div>
+                    <span id="sarStatus" class="status-text">Disabled</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Center Panel - Phone Mirror Area -->
+            <div class="center-panel">
+                <div class="phone-mirror-area">
+                    <div id="mirrorPlaceholder" class="mirror-placeholder">
+                        <div class="placeholder-content">
+                            <div class="placeholder-icon">📱</div>
+                            <h3>Phone Mirror</h3>
+                            <p>Click "Start Capture" to begin phone mirroring</p>
+                        </div>
+                    </div>
+                    <div id="sarOverlay" class="sar-overlay hidden">
+                        <div class="sar-indicator">
+                            <span class="sar-dot"></span>
+                            <span>SAR Detection Active</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Console Panel (moved to right side) -->
+            <div class="console-panel-right">
+                <div class="console-header">
+                    <h4>Console Output</h4>
+                    <button id="clearConsole" class="btn btn-small">Clear</button>
+                </div>
+                <div id="consoleOutput" class="console-content"></div>
+            </div>
+        </main>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+</html>

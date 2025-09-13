@@ -1,0 +1,25 @@
+{
+  "timestamp": 1757455098.1504984,
+  "stats": {
+    "accuracy": 0.0,
+    "precision": 0.0,
+    "recall": 0.0,
+    "total_detections": 0,
+    "training_samples": 1000,
+    "training_active": true,
+    "recent_accuracy": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "feedback_count": 0,
+  "training_samples": 1000
+}

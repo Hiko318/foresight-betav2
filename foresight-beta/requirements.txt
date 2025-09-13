@@ -1,0 +1,19 @@
+# Python dependencies for Argus YOLO detection
+opencv-python==4.8.1.78
+numpy==1.24.3
+mss==10.1.0
+pywin32==311
+opencv-python==4.12.0.88
+ultralytics==8.3.195
+pillow==11.3.0
+numpy>=2.0.0
+argparse
+pathlib
+
+# Optional: For advanced YOLO models
+# torch>=1.9.0
+# torchvision>=0.10.0
+# ultralytics>=8.0.0
+
+# For GPU acceleration (optional lang)
+# opencv-contrib-python==4.8.1.78
