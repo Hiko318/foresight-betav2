@@ -19,6 +19,14 @@ class ForesightApp {
     this.mainWindowState = 'normal'; // Track main window state
     this.scrcpyFocused = false; // Track if scrcpy window is focused
     this.focusMonitorInterval = null; // Interval for monitoring focus
+    // Embed scrcpy state
+    this.phoneMirrorBounds = null;
+    this.embedScrcpyEnabled = true;
+    this.embedMonitorInterval = null;
+    this.lastEmbedErrorTs = 0;
+    // Gallery watcher
+    this.galleryWatcher = null;
+    this.galleryWatchDir = null;
   }
 
   createMainWindow() {
@@ -32,7 +40,7 @@ class ForesightApp {
         enableRemoteModule: true,
         backgroundThrottling: false  // ChatGPT recommendation #7: Disable background throttling
       },
-      icon: path.join(__dirname, '../assets/icon.png'),
+      icon: path.join(__dirname, '../assets/icon.ico'),
       title: 'Foresight',
       resizable: true,
       minimizable: true,
@@ -357,10 +365,13 @@ class ForesightApp {
 
   setupWindowTracking() {
     if (!this.mainWindow || !this.isCapturing) return;
-    
-    // Set up window positioning with multiple attempts
+    // Skip legacy window positioning when embedding is enabled
+    if (this.embedScrcpyEnabled) {
+      this.mainWindow.webContents.send('console-log', 'Embedding mode enabled - skipping legacy scrcpy layering');
+      return;
+    }
+    // Legacy: external window positioning
     this.positionScrcpyWindow();
-    
     this.mainWindow.webContents.send('console-log', 'Window layering enabled - scrcpy on layer 2, main app on layer 1');
   }
   
@@ -690,7 +701,9 @@ class ForesightApp {
       }
       
       // Device found, start scrcpy
-      const deviceId = devices[0].split('\t')[0];
+      // Robustly parse device id: split on any whitespace and take the first token
+      const deviceLine = devices[0].trim();
+      const deviceId = deviceLine.split(/\s+/)[0];
       this.mainWindow.webContents.send('console-log', `Device detected: ${deviceId}`);
       this.mainWindow.webContents.send('console-log', 'Starting screen mirror...');
       
@@ -718,9 +731,14 @@ class ForesightApp {
         '--max-fps=30'  // ChatGPT Fix #5: Tame FPS for stability (30 FPS reduces flicker)
       ]);
       
-      // Set up window tracking after a delay to ensure scrcpy window is created
+      // After scrcpy initializes, embed it into the control panel
       setTimeout(() => {
-        this.setupWindowTracking();
+        if (this.embedScrcpyEnabled) {
+          this.embedScrcpyWindow();
+          this.startEmbedMonitor();
+        } else {
+          this.setupWindowTracking();
+        }
       }, 2000);
 
       // Forward scrcpy logs for easier diagnostics
@@ -747,6 +765,7 @@ class ForesightApp {
         this.isCapturing = false;
         this.mainWindow.webContents.send('console-log', 'Screen mirror stopped.');
         this.mainWindow.webContents.send('capture-stopped');
+        this.stopEmbedMonitor();
       });
 
       // Notify renderer
@@ -766,6 +785,7 @@ class ForesightApp {
     // Remove window tracking listeners
     this.mainWindow.removeAllListeners('move');
     this.mainWindow.removeAllListeners('resize');
+    this.stopEmbedMonitor();
     
     // Clear synchronization monitor
     this.clearSynchronizationMonitor();
@@ -854,6 +874,7 @@ class ForesightApp {
         }
         this.sarModeEnabled = false;
         this.mainWindow.webContents.send('sar-stopped');
+        this.stopEmbedMonitor();
         // Close overlay window when scrcpy stops
         if (this.overlayWindow) {
           this.overlayWindow.close();
@@ -873,6 +894,10 @@ class ForesightApp {
     
     // Wait for scrcpy window to be created, then start YOLO
     setTimeout(() => {
+      if (this.embedScrcpyEnabled) {
+        this.embedScrcpyWindow();
+        this.startEmbedMonitor();
+      }
       const scriptPath = path.join(__dirname, '../scripts/yolo_detection.py');
       console.log(`Starting YOLO with script: ${scriptPath}`);
       this.mainWindow.webContents.send('console-log', `Starting YOLO with script: ${scriptPath}`);
@@ -1267,6 +1292,264 @@ class ForesightApp {
         this.mainWindow && this.mainWindow.webContents.send('console-log', `Failed to set folder: ${e.message}`);
       }
     });
+
+    // Provide detected images from configured folder (or default)
+    ipcMain.on('get-detected-images', (event, limit = 200) => {
+      const targetDir = this.faceSaveDir || 'C\\\\Users\\\\Asus\\\\Desktop\\\\Detected';
+      const payload = this._buildDetectedImagesPayload(targetDir, limit);
+      // Start or move watcher to this directory for real-time updates
+      this._attachGalleryWatcher(targetDir, limit);
+      event.reply('detected-images', payload);
+    });
+
+    // Receive phone mirror panel bounds from renderer to position embedded scrcpy
+    ipcMain.on('phone-mirror/bounds', (event, bounds) => {
+      try {
+        this.phoneMirrorBounds = bounds;
+        if (this.embedScrcpyEnabled) {
+          this.embedScrcpyWindow();
+        }
+      } catch (e) {
+        const now = Date.now();
+        if (now - this.lastEmbedErrorTs > 3000) {
+          this.lastEmbedErrorTs = now;
+          this.mainWindow && this.mainWindow.webContents.send('console-log', `[FORESIGHT][EMBED] bounds update failed: ${e.message}`);
+        }
+      }
+    });
+  }
+
+  _buildDetectedImagesPayload(targetDir, limit = 200) {
+    const fs = require('fs');
+    let files = [];
+    try {
+      const entries = fs.readdirSync(targetDir);
+      files = entries
+        .filter(name => /\.(jpg|jpeg|png|webp)$/i.test(name))
+        .map(name => path.join(targetDir, name));
+      files.sort((a, b) => {
+        try {
+          return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+        } catch {
+          return 0;
+        }
+      });
+      files = files.slice(0, limit);
+    } catch (e) {
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `Gallery load failed: ${e.message}`);
+    }
+    return { dir: targetDir, files };
+  }
+
+  _attachGalleryWatcher(targetDir, limit = 200) {
+    const fs = require('fs');
+    try {
+      if (this.galleryWatcher && this.galleryWatchDir === targetDir) {
+        return; // Already watching this dir
+      }
+      // Close existing watcher
+      if (this.galleryWatcher) {
+        try { this.galleryWatcher.close(); } catch {}
+        this.galleryWatcher = null;
+      }
+      this.galleryWatchDir = targetDir;
+      // Debounce burst of events
+      let timer = null;
+      this.galleryWatcher = fs.watch(targetDir, { persistent: true }, (eventType, filename) => {
+        if (filename && /\.(jpg|jpeg|png|webp)$/i.test(filename)) {
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(() => {
+            const payload = this._buildDetectedImagesPayload(targetDir, limit);
+            this.mainWindow && this.mainWindow.webContents.send('detected-images', payload);
+          }, 150);
+        }
+      });
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `[FORESIGHT] Gallery watching: ${targetDir}`);
+    } catch (e) {
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `[FORESIGHT] Gallery watch failed: ${e.message}`);
+    }
+  }
+
+  // --- scrcpy embed helpers (Windows) ---
+  embedScrcpyWindow() {
+    if (!this.isCapturing || !this.scrcpyProcess) return;
+    const b = this.phoneMirrorBounds;
+    if (!b) return;
+    const { x, y, width, height } = b;
+    const psCommand = `
+      Add-Type -TypeDefinition '
+        using System;
+        using System.Runtime.InteropServices;
+        public static class Win32API {
+          [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+          [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+          [DllImport("user32.dll")] public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+          [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        }
+      '
+      $proc = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq "Foresight Phone Mirror"} | Select-Object -First 1
+      $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Foresight"} | Select-Object -First 1
+      if (-not $proc -or -not $mainWindow) { exit 1 }
+      $GWL_STYLE = -16
+      $WS_CHILD = 0x40000000
+      $WS_VISIBLE = 0x10000000
+      $WS_POPUP = 0x80000000
+      $WS_OVERLAPPEDWINDOW = 0x00CF0000
+      $style = [Win32API]::GetWindowLong($proc.MainWindowHandle, $GWL_STYLE)
+      $newStyle = ($style -bor $WS_CHILD -bor $WS_VISIBLE) -band (-bnot ($WS_POPUP -bor $WS_OVERLAPPEDWINDOW))
+      [Win32API]::SetWindowLong($proc.MainWindowHandle, $GWL_STYLE, $newStyle) | Out-Null
+      [Win32API]::SetParent($proc.MainWindowHandle, $mainWindow.MainWindowHandle) | Out-Null
+      [Win32API]::SetWindowPos($proc.MainWindowHandle, [IntPtr]::Zero, ${x}, ${y}, ${width}, ${height}, 0x0040) | Out-Null
+      Write-Host "EMBED_OK"
+    `;
+    exec(`powershell -Command "${psCommand}"`, (error, stdout, stderr) => {
+      if (error) {
+        const now = Date.now();
+        if (now - this.lastEmbedErrorTs > 3000) {
+          this.lastEmbedErrorTs = now;
+          this.mainWindow && this.mainWindow.webContents.send('console-log', `[FORESIGHT][EMBED] error: ${error.message}`);
+        }
+        return;
+      }
+      const out = (stdout || '').toString().trim();
+      if (out.includes('EMBED_OK')) {
+        this.mainWindow && this.mainWindow.webContents.send('console-log', '[FORESIGHT][EMBED] embedded scrcpy into control panel');
+      }
+    });
+  }
+
+  startEmbedMonitor() {
+    if (this.embedMonitorInterval) return;
+    // Event-driven enforcement: keep scrcpy visually on top
+    if (this.mainWindow && !this.enforceZOrderAttached) {
+      this.mainWindow.on('focus', () => this.forceScrcpyTopMost());
+      this.mainWindow.on('blur', () => this.forceScrcpyTopMost());
+      this.mainWindow.on('move', () => this.forceScrcpyTopMost());
+      this.mainWindow.on('resize', () => this.forceScrcpyTopMost());
+      this.mainWindow.on('show', () => { this.showScrcpyWindow(); this.forceScrcpyTopMost(); });
+      this.mainWindow.on('minimize', () => this.hideScrcpyWindow());
+      this.mainWindow.on('restore', () => { this.showScrcpyWindow(); this.forceScrcpyTopMost(); });
+      this.enforceZOrderAttached = true;
+    }
+
+    // Periodic enforcement to recover from any z-order drift
+    this.embedMonitorInterval = setInterval(() => {
+      if (!this.isCapturing || !this.scrcpyProcess) return;
+      this.embedScrcpyWindow();
+      this.forceScrcpyTopMost();
+    }, 250);
+  }
+
+  stopEmbedMonitor() {
+    if (this.embedMonitorInterval) {
+      clearInterval(this.embedMonitorInterval);
+      this.embedMonitorInterval = null;
+    }
+    // Note: listeners are lightweight; keep them until app stops capture
+  }
+
+  // Keep scrcpy window at the top of the control panel area
+  enforceScrcpyTop() {
+    if (!this.isCapturing || !this.scrcpyProcess) return;
+    const b = this.phoneMirrorBounds;
+    if (!b) return;
+    const psCommand = `
+      Add-Type -TypeDefinition '
+        using System;
+        using System.Runtime.InteropServices;
+        public static class Win32API {
+          [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        }
+      '
+      $proc = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq "Foresight Phone Mirror"} | Select-Object -First 1
+      if (-not $proc) { exit 1 }
+      # Z-order only: keep at top among siblings without moving, sizing, or activating
+      $SWP_NOSIZE = 0x0001
+      $SWP_NOMOVE = 0x0002
+      $SWP_NOACTIVATE = 0x0010
+      [Win32API]::SetWindowPos($proc.MainWindowHandle, [IntPtr]::Zero, 0, 0, 0, 0, $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE) | Out-Null
+      Write-Host "ZTOP_OK"
+    `;
+    exec(`powershell -Command "${psCommand}"`, (error, stdout, stderr) => {
+      // No noisy logging; this runs frequently
+    });
+  }
+
+  // Force global topmost so it always stays above control panel; tie visibility to main window
+  forceScrcpyTopMost() {
+    if (!this.isCapturing || !this.scrcpyProcess) return;
+    const psCommand = `
+      Add-Type -TypeDefinition '
+        using System;
+        using System.Runtime.InteropServices;
+        public static class Win32API {
+          [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+          [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+          [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+          [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        }
+      '
+      $proc = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq "Foresight Phone Mirror"} | Select-Object -First 1
+      if (-not $proc) { exit 1 }
+      $GWL_STYLE = -16
+      $WS_CHILD = 0x40000000
+      # Ensure it is a top-level window (remove child style)
+      $style = [Win32API]::GetWindowLong($proc.MainWindowHandle, $GWL_STYLE)
+      if ($style -band $WS_CHILD) {
+        $newStyle = $style -band -bnot $WS_CHILD
+        [Win32API]::SetWindowLong($proc.MainWindowHandle, $GWL_STYLE, $newStyle) | Out-Null
+      }
+      # Make window topmost without activation
+      $SWP_NOSIZE = 0x0001
+      $SWP_NOMOVE = 0x0002
+      $SWP_NOACTIVATE = 0x0010
+      # HWND_TOPMOST = -1
+      [Win32API]::SetWindowPos($proc.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE) | Out-Null
+      Write-Host "TOPMOST_OK"
+    `;
+    exec(`powershell -Command "${psCommand}"`, () => {});
+  }
+
+  hideScrcpyWindow() {
+    if (!this.isCapturing || !this.scrcpyProcess) return;
+    const psCommand = `
+      Add-Type -TypeDefinition '
+        using System;
+        using System.Runtime.InteropServices;
+        public static class Win32API { [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); }
+      '
+      $proc = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq "Foresight Phone Mirror"} | Select-Object -First 1
+      if (-not $proc) { exit 1 }
+      # SW_HIDE = 0
+      [Win32API]::ShowWindow($proc.MainWindowHandle, 0) | Out-Null
+      Write-Host "HIDE_OK"
+    `;
+    exec(`powershell -Command "${psCommand}"`, () => {});
+  }
+
+  showScrcpyWindow() {
+    if (!this.isCapturing || !this.scrcpyProcess) return;
+    const psCommand = `
+      Add-Type -TypeDefinition '
+        using System;
+        using System.Runtime.InteropServices;
+        public static class Win32API {
+          [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+          [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        }
+      '
+      $proc = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq "Foresight Phone Mirror"} | Select-Object -First 1
+      if (-not $proc) { exit 1 }
+      # SW_SHOW = 5
+      [Win32API]::ShowWindow($proc.MainWindowHandle, 5) | Out-Null
+      # Restore topmost order
+      $SWP_NOSIZE = 0x0001
+      $SWP_NOMOVE = 0x0002
+      $SWP_NOACTIVATE = 0x0010
+      [Win32API]::SetWindowPos($proc.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE) | Out-Null
+      Write-Host "SHOW_OK"
+    `;
+    exec(`powershell -Command "${psCommand}"`, () => {});
   }
 
   loadFaceSaveSettings() {

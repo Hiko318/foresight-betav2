@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Foresight</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Poppins:wght@400;600&family=Roboto:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -11,28 +14,34 @@
         <!-- Header -->
         <header class="header">
             <div class="logo">
-                <div class="logo-icon">🔮</div>
                 <h1>FORESIGHT</h1>
             </div>
-            <div class="header-controls">
-                <button id="startCapture" class="btn btn-success">Start Capture</button>
-                <button id="stopCapture" class="btn btn-danger" disabled>Stop Capture</button>
-                <button id="testDisplay" class="btn btn-info">Test Display</button>
-                <div class="sar-toggle">
-                    <label class="toggle-label">SAR Mode</label>
-                    <div class="toggle-switch">
-                        <input type="checkbox" id="sarMode" class="toggle-input">
-                        <label for="sarMode" class="toggle-slider"></label>
-                    </div>
-                    <span id="sarStatus" class="status-text">Disabled</span>
+            <div class="header-controls toolbar">
+                <div class="button-group">
+                    <button id="startCapture" class="btn btn-success">Start Capture</button>
+                    <button id="stopCapture" class="btn btn-danger" disabled>Stop Capture</button>
                 </div>
-                <div class="sar-toggle">
-                    <label class="toggle-label">Log Detections</label>
-                    <div class="toggle-switch">
-                        <input type="checkbox" id="dbLogging" class="toggle-input">
-                        <label for="dbLogging" class="toggle-slider"></label>
+                <div class="button-group">
+                    <button id="testDisplay" class="btn btn-info">Test Display</button>
+                    <button id="openGallery" class="btn btn-info">Open Gallery</button>
+                </div>
+                <div class="button-group toggles">
+                    <div class="sar-toggle">
+                        <label class="toggle-label">SAR Mode</label>
+                        <div class="toggle-switch">
+                            <input type="checkbox" id="sarMode" class="toggle-input">
+                            <label for="sarMode" class="toggle-slider"></label>
+                        </div>
+                        <span id="sarStatus" class="status-text">Disabled</span>
                     </div>
-                    <span id="dbLogStatus" class="status-text">Disabled</span>
+                    <div class="sar-toggle">
+                        <label class="toggle-label">Log Detections</label>
+                        <div class="toggle-switch">
+                            <input type="checkbox" id="dbLogging" class="toggle-input">
+                            <label for="dbLogging" class="toggle-slider"></label>
+                        </div>
+                        <span id="dbLogStatus" class="status-text">Disabled</span>
+                    </div>
                 </div>
             </div>
         </header>
@@ -42,6 +51,9 @@
             <!-- Center Panel - Phone Mirror Area -->
             <div class="center-panel">
                 <div class="phone-mirror-area">
+                    <div class="live-feed hidden">LIVE FEED</div>
+                    <!-- Embedded scrcpy child will be positioned to this panel -->
+                    <div id="phoneMirrorPanel" class="phone-mirror-panel"></div>
                     <div id="mirrorPlaceholder" class="mirror-placeholder">
                         <div class="placeholder-content">
                             <div class="placeholder-icon">📱</div>
@@ -58,22 +70,39 @@
                 </div>
             </div>
 
-            <!-- Right Side Panel: Detection Logs Dropdown (replaces Console Output) -->
+            <!-- Right Side Panel (empty by default, gallery can take over full height) -->
             <div class="console-panel-right">
-                <div class="console-header">
-                    <h4>Console Output</h4>
-                    <button id="clearConsole" class="btn btn-small">Clear</button>
-                </div>
-                <div id="consoleOutput" class="console-content"></div>
-
-                <div class="face-save-controls">
-                    <div class="face-save-header">
-                        <h4>Face Save Folder</h4>
-                        <button id="chooseFaceFolder" class="btn btn-small">Choose</button>
+                <!-- Full-height Gallery (covers console when open) -->
+                    <div id="galleryMain" class="gallery-main">
+                    <div class="gallery-header">
+                        <h4>Detected Gallery</h4>
+                        <div class="gallery-actions">
+                            <button id="setGalleryFolder" class="btn btn-small">Set Folder</button>
+                            <button id="refreshGallery" class="btn btn-small">Refresh</button>
+                        </div>
+                        <div id="galleryDirPath" class="gallery-path">Folder: Not set</div>
                     </div>
-                    <div id="faceSavePath" class="face-save-path">Not set</div>
+                    <div id="galleryGrid" class="gallery-body gallery-grid"></div>
                 </div>
 
+                <!-- Console content (hidden by default) -->
+                <div id="rightConsole" class="right-console panel-hidden">
+                    <div class="console-header">
+                        <h4>Console Output</h4>
+                        <button id="clearConsole" class="btn btn-small">Clear</button>
+                    </div>
+                    <div id="consoleOutput" class="console-content"></div>
+
+                    <div class="face-save-controls">
+                        <div class="face-save-header">
+                            <h4>Face Save Folder</h4>
+                            <button id="chooseFaceFolder" class="btn btn-small">Choose</button>
+                        </div>
+                        <div id="faceSavePath" class="face-save-path">Not set</div>
+                    </div>
+                </div>
+
+                <!-- Detection Logs (toggle acts the same) -->
                 <div id="detectionLogPanel" class="slide-panel collapsed">
                     <div class="slide-header">
                         <h4>Detection Logs</h4>
@@ -83,8 +112,19 @@
                     </div>
                     <div id="detectionLogList" class="slide-content"></div>
                 </div>
+
+                <!-- Image Preview Modal (right panel only) -->
+                <div id="imagePreview" class="image-preview hidden">
+                    <div class="preview-backdrop"></div>
+                    <div class="preview-content">
+                        <img id="previewImg" class="preview-img" src="" alt="Preview">
+                    </div>
+                </div>
             </div>
         </main>
+        <footer class="footer-status">
+            <div id="footerStatus">Connected | YOLO Active | 30 FPS</div>
+        </footer>
     </div>
 
     <script src="renderer.js"></script>
