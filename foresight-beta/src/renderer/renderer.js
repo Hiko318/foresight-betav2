@@ -1,9 +1,10 @@
 const { ipcRenderer } = require('electron');
 
-class ArgusRenderer {
+class ForesightRenderer {
     constructor() {
         this.isCapturing = false;
         this.sarModeEnabled = false;
+        this.detectionLoggingEnabled = false;
         this.initializeElements();
         this.setupEventListeners();
         this.setupIpcListeners();
@@ -15,20 +16,33 @@ class ArgusRenderer {
         this.startCaptureBtn = document.getElementById('startCapture');
         this.stopCaptureBtn = document.getElementById('stopCapture');
         this.testDisplayBtn = document.getElementById('testDisplay');
+        
+        // Console
         this.clearConsoleBtn = document.getElementById('clearConsole');
+        this.consoleOutput = document.getElementById('consoleOutput');
         
         // SAR Mode
         this.sarModeToggle = document.getElementById('sarMode');
         this.sarStatus = document.getElementById('sarStatus');
         this.sarOverlay = document.getElementById('sarOverlay');
+
+        // DB Logging
+        this.dbLoggingToggle = document.getElementById('dbLogging');
+        this.dbLogStatus = document.getElementById('dbLogStatus');
         
         // Status elements (removed loadingText as left panel is gone)
         
-        // Console
-        this.consoleOutput = document.getElementById('consoleOutput');
+        // Detection log panel
+        this.detectionLogPanel = document.getElementById('detectionLogPanel');
+        this.detectionLogList = document.getElementById('detectionLogList');
+        this.refreshDetectionsBtn = document.getElementById('refreshDetections');
         
         // Mirror area
         this.mirrorPlaceholder = document.getElementById('mirrorPlaceholder');
+
+        // Face save folder controls
+        this.faceSavePathDisplay = document.getElementById('faceSavePath');
+        this.chooseFaceFolderBtn = document.getElementById('chooseFaceFolder');
     }
 
     setupEventListeners() {
@@ -50,12 +64,27 @@ class ArgusRenderer {
             this.toggleSarMode();
         });
 
+        // DB Logging toggle
+        this.dbLoggingToggle.addEventListener('change', () => {
+            this.toggleDbLogging();
+        });
+
         // Console clear
         this.clearConsoleBtn.addEventListener('click', () => {
             this.clearConsole();
         });
 
+        // Refresh detections
+        this.refreshDetectionsBtn.addEventListener('click', () => {
+            this.requestDetectionLogs();
+        });
+
         // Removed left panel event listeners
+
+        // Choose face save folder
+        this.chooseFaceFolderBtn.addEventListener('click', () => {
+            ipcRenderer.send('choose-face-save-dir');
+        });
     }
 
     setupIpcListeners() {
@@ -109,12 +138,36 @@ class ArgusRenderer {
         ipcRenderer.on('status-update', (event, status) => {
             this.isCapturing = status.isCapturing;
             this.sarModeEnabled = status.sarModeEnabled;
+            this.detectionLoggingEnabled = !!status.detectionLoggingEnabled;
+            this.dbLoggingToggle.checked = this.detectionLoggingEnabled;
             this.updateUI();
         });
 
         // Console log messages from main process
         ipcRenderer.on('console-log', (event, message) => {
             this.logToConsole(message, 'info');
+        });
+
+        // Live updates when a detection is logged
+        ipcRenderer.on('detection-logged', (event, row) => {
+            this.appendDetectionRow(row);
+        });
+
+        // Render detection logs from main
+        ipcRenderer.on('detection-logs', (event, rows) => {
+            this.renderDetectionLogs(rows);
+        });
+
+        // Face save folder updates
+        ipcRenderer.on('face-save-dir', (event, dirPath) => {
+            this.faceSavePathDisplay.textContent = dirPath || 'Not set';
+        });
+
+        // Notification when a face has been saved
+        ipcRenderer.on('face-saved', (event, info) => {
+            if (info && info.path) {
+                this.logToConsole(`Face saved to: ${info.path}`, 'success');
+            }
         });
     }
 
@@ -125,13 +178,24 @@ class ArgusRenderer {
 
     stopCapture() {
         this.logToConsole('Stopping phone capture...', 'info');
-        this.loadingText.textContent = 'Stopping capture...';
         ipcRenderer.send('stop-capture');
     }
 
     toggleSarMode() {
         this.logToConsole('Toggling SAR mode...', 'info');
         ipcRenderer.send('toggle-sar');
+    }
+
+    toggleDbLogging() {
+        const enabled = this.dbLoggingToggle.checked;
+        ipcRenderer.send('set-detection-logging', enabled);
+        // Toggle slide panel visibility
+        if (enabled) {
+            this.detectionLogPanel.classList.add('expanded');
+            this.requestDetectionLogs();
+        } else {
+            this.detectionLogPanel.classList.remove('expanded');
+        }
     }
 
     testDisplay() {
@@ -162,6 +226,10 @@ class ArgusRenderer {
         // Update SAR status text
         this.sarStatus.textContent = this.sarModeEnabled ? 'Enabled' : 'Disabled';
         this.sarStatus.style.color = this.sarModeEnabled ? '#00ff88' : '#aaa';
+
+        // Update DB logging status
+        this.dbLogStatus.textContent = this.detectionLoggingEnabled ? 'Enabled' : 'Disabled';
+        this.dbLogStatus.style.color = this.detectionLoggingEnabled ? '#00ff88' : '#aaa';
         
         // Removed loading text update (left panel removed)
     }
@@ -210,15 +278,41 @@ class ArgusRenderer {
         this.logToConsole('Console cleared', 'info');
     }
 
+    // Detection logs rendering helpers
+    requestDetectionLogs(limit = 50) {
+        ipcRenderer.send('get-detection-logs', limit);
+    }
+
+    renderDetectionLogs(rows) {
+        if (!Array.isArray(rows)) return;
+        this.detectionLogList.innerHTML = '';
+        rows.forEach(row => this.appendDetectionRow(row));
+    }
+
+    appendDetectionRow(row) {
+        if (!row) return;
+        const el = document.createElement('div');
+        el.className = 'detection-row';
+        const time = new Date(row.timestamp).toLocaleTimeString();
+        el.innerHTML = `<span class="detection-type">${row.type}</span><span class="detection-time">${time}</span>`;
+        this.detectionLogList.prepend(el);
+        // Cap list length
+        const children = this.detectionLogList.children;
+        if (children.length > 100) {
+            this.detectionLogList.removeChild(children[children.length - 1]);
+        }
+    }
+
     // Request initial status
     requestStatus() {
         ipcRenderer.send('get-status');
+        ipcRenderer.send('get-face-save-dir');
     }
 }
 
 // Initialize the renderer when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-    const app = new ArgusRenderer();
+    const app = new ForesightRenderer();
     
     // Request initial status
     setTimeout(() => {
@@ -226,6 +320,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 500);
     
     // Log startup
-    app.logToConsole('Argus initialized', 'success');
+    app.logToConsole('Foresight initialized', 'success');
     app.logToConsole('Ready for phone capture and SAR detection', 'info');
 });

@@ -1,12 +1,12 @@
 @echo off
-REM Argus Setup Wizard Launcher
+REM Foresight Setup Wizard Launcher
 REM This launches the PowerShell-based setup wizard
 
-title Argus Setup
+title Foresight Setup
 
 echo.
 echo ================================================
-echo    Argus Setup Wizard
+echo    Foresight Setup Wizard
 echo ================================================
 echo.
 echo Starting setup wizard...

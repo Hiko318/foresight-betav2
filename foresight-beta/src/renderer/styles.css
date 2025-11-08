@@ -243,7 +243,7 @@ body {
     50% { opacity: 0.5; }
 }
 
-/* Console Panel Right */
+/* Right-side panel container */
 .console-panel-right {
     width: 350px;
     background: rgba(0, 0, 0, 0.8);
@@ -252,7 +252,75 @@ body {
     flex-direction: column;
 }
 
-/* Console Panel */
+/* Slide-down Detection Panel */
+.slide-panel {
+    background: rgba(0, 0, 0, 0.85);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+}
+
+.slide-panel.expanded {
+    max-height: 240px;
+}
+
+.slide-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    background: rgba(0, 0, 0, 0.9);
+}
+
+.slide-header h4 {
+    color: #00ff88;
+    font-size: 14px;
+    margin: 0;
+}
+
+.slide-content {
+    padding: 10px 16px;
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+.detection-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 0;
+    border-bottom: 1px dashed rgba(255, 255, 255, 0.1);
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.detection-type {
+    font-weight: 600;
+    color: #00ff88;
+}
+
+.detection-time {
+    color: #aaa;
+}
+
+/* Scrollbar Styles */
+::-webkit-scrollbar {
+    width: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.5);
+}
 .console-header {
     display: flex;
     justify-content: space-between;
@@ -295,20 +363,27 @@ body {
     color: #74c0fc;
 }
 
-/* Scrollbar Styles */
-::-webkit-scrollbar {
-    width: 6px;
+/* Face Save Controls */
+.face-save-controls {
+    padding: 10px 16px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(0, 0, 0, 0.6);
 }
 
-::-webkit-scrollbar-track {
-    background: rgba(255, 255, 255, 0.1);
+.face-save-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
 }
 
-::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.3);
-    border-radius: 3px;
+.face-save-header h4 {
+    color: #00ff88;
+    font-size: 14px;
+    margin: 0;
 }
 
-::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.5);
+.face-save-path {
+    margin-top: 6px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.85);
 }

@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """
-Argus - YOLO Detection Script
+Foresight - YOLO Detection Script
 This script handles SAR (Search and Rescue) mode detection using YOLO
 """
+
+# Force UTF-8 console to avoid UnicodeEncodeError
+import os, sys
+os.environ["PYTHONIOENCODING"] = "utf-8"
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 import cv2
 import numpy as np
@@ -11,7 +20,63 @@ import time
 import sys
 import os
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
+import uuid
+
+# Ensure DeepFace weights directory exists and startup self-test (ASCII-only)
+try:
+    from deepface import DeepFace
+    os.makedirs(r"C:\Users\Asus\.deepface\weights", exist_ok=True)
+    print("[FORESIGHT][DeepFace] Testing ArcFace...")
+    try:
+        DeepFace.build_model("ArcFace")
+        print("[FORESIGHT][DeepFace] OK: ArcFace model loaded.")
+    except Exception as e:
+        print("[FORESIGHT][DeepFace] FAIL:", repr(e))
+        if "arcface_weights.h5" in str(e).lower():
+            print("[FORESIGHT][DeepFace] Missing weights. Place file at C:\\Users\\Asus\\.deepface\\weights\\arcface_weights.h5")
+        print("[FORESIGHT][DeepFace] Continuing without DeepFace.")
+except Exception as e:
+    # DeepFace import itself failed; continue without DeepFace
+    print("[FORESIGHT][DeepFace] FAIL:", repr(e))
+    print("[FORESIGHT][DeepFace] Continuing without DeepFace.")
+
+# =============================================================
+# Foresight Face Save & DB Match System (ArcFace, cosine)
+#
+# Save directories and toggles:
+# - SAVE_DIR: where new detected faces are saved
+# - DB_DIR:   canonical DB of known faces (used by DeepFace.find)
+# - BYPASS_DEEPFACE: if True, skip DB check and save immediately
+# - FORCE_ALWAYS_SAVE: if True, always save even if DB match
+# - FRAMES_REQUIRED: consecutive frames per track before running face job
+# - MIN_FACE_SIZE: minimum crop size to attempt face extraction
+# - LOG_PREFIX: prefix added to all logs for easier filtering
+#
+# Thresholds:
+# - DEEPFACE_MODEL: "ArcFace"
+# - DEEPFACE_METRIC: "cosine"
+# - DEEPFACE_THRESH: 0.33 (<= is considered a match)
+#
+# Notes:
+# - Faces < MIN_FACE_SIZE are skipped
+# - Retain only 1 representative face (middle of burst)
+# - Do not upgrade TensorFlow/Keras; ignore their deprecation warnings
+# =============================================================
+SAVE_DIR = r"C:\Users\Asus\Desktop\Detected"
+DB_DIR   = r"C:\Users\Asus\Desktop\Detected_DB"
+FACE_DETECTOR_BACKEND = "retinaface"
+DEEPFACE_MODEL, DEEPFACE_METRIC, DEEPFACE_THRESH = "ArcFace", "cosine", 0.33
+FRAMES_REQUIRED, MIN_FACE_SIZE = 5, 40
+BYPASS_DEEPFACE, FORCE_ALWAYS_SAVE = True, False
+LOG_PREFIX = "[FORESIGHT]"
+GLOBAL_WINDOW_OVERLAY = None
+
+try:
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    os.makedirs(DB_DIR, exist_ok=True)
+except Exception as _e:
+    print(f"{LOG_PREFIX}[SETUP]dir_err:{_e}", flush=True)
 try:
     import win32gui
     import win32ui
@@ -19,6 +84,43 @@ try:
     import win32api
 except ImportError:
     print("[WARNING] pywin32 not available - window overlay features disabled")
+
+# -------------------------------------------------------------
+# Window handle helpers and state for scrcpy capture hardening
+# -------------------------------------------------------------
+WINDOW_TITLE_SUBSTR = "Foresight Phone Mirror"
+SCRCPY_HWND = None
+SCRCPY_LAST_OK = 0.0  # timestamp of last successful GetWindowRect
+SCRCPY_OK_CONSEC = 0  # count of consecutive successful GetWindowRect calls
+_WIN_INVALID_LOG_LAST = 0.0
+_WIN_WAIT_LOG_LAST = 0.0
+_WIN_GETRECT_ERR_LAST = 0.0
+
+def get_hwnd_by_title_substr(substr):
+    """Return first visible HWND whose title contains substr (case-insensitive)."""
+    try:
+        matches = []
+        sub = (substr or "").lower()
+        def enum_windows_callback(hwnd, windows):
+            try:
+                if win32gui.IsWindowVisible(hwnd):
+                    title = win32gui.GetWindowText(hwnd) or ""
+                    if sub in title.lower():
+                        windows.append(hwnd)
+            except Exception:
+                pass
+            return True
+        win32gui.EnumWindows(enum_windows_callback, matches)
+        return matches[0] if matches else None
+    except Exception:
+        return None
+
+def is_valid_hwnd(hwnd):
+    """Return True if hwnd is a valid and visible window."""
+    try:
+        return bool(hwnd) and bool(win32gui.IsWindow(hwnd)) and bool(win32gui.IsWindowVisible(hwnd))
+    except Exception:
+        return False
 
 class ObjectTracker:
     def __init__(self, smoothing_factor=0.85, max_distance=50, frame_skip_interval=1, grace_period_ms=300):
@@ -370,34 +472,34 @@ class StaticDetectionZones:
         return list(self.tracked_objects.values())
 
 class YOLODetector:
-    def __init__(self, model_name="yolo11m.pt", use_fallback=False):
+    def __init__(self, model_name="yolo11n.pt", use_fallback=False):  # Use nano model for speed
         self.model = None
         self.model_name = model_name
-        self.confidence_threshold = 0.05  # Lower threshold to detect more people
-        # Initialize object tracker for responsive detection
+        self.confidence_threshold = 0.15  # Lowered for higher detection rate - catch more partial humans
+        # Initialize object tracker for ultra-responsive detection
         self.tracker = ObjectTracker(
-            smoothing_factor=0.7,  # Reduced smoothing for more responsive detection
-            max_distance=100,
+            smoothing_factor=0.5,  # Minimal smoothing for maximum responsiveness
+            max_distance=80,
             frame_skip_interval=1,   # Process EVERY frame for maximum speed
-            grace_period_ms=150     # Shorter grace period for faster response
+            grace_period_ms=100     # Ultra-short grace period for instant response
         )
         self.use_fallback = use_fallback
         # ULTRA-HIGH FREQUENCY: No frame skipping - maximum detection speed
         self.detection_counter = 0
         
-        # Enhanced detection stabilization for flicker-free boxes
+        # Ultra-responsive detection for real-time performance
         self.previous_detections = []
         self.persistent_detections = {}  # Track detections across frames
-        self.smoothing_factor = 0.6  # Reduced smoothing for more responsive detection
-        self.min_confidence_diff = 0.15  # Minimum confidence change to update detection
-        self.detection_persistence = 10  # Shorter persistence for more responsive detection
-        self.min_confidence_for_new = 0.3  # Lower threshold for new detections to catch more people
+        self.smoothing_factor = 0.3  # Minimal smoothing for instant updates
+        self.min_confidence_diff = 0.1   # Lower threshold for faster updates
+        self.detection_persistence = 5   # Very short persistence for real-time response
+        self.min_confidence_for_new = 0.12  # Even lower threshold for maximum detection coverage
         
-        # Motion detection for screen stability
+        # Optimized motion detection for ultra-low latency
         self.prev_frame = None
-        self.motion_threshold = 30.0  # Threshold for detecting significant motion
+        self.motion_threshold = 10.0  # Ultra-sensitive motion detection for better coverage
         self.frame_buffer = []  # Buffer to store recent frames
-        self.buffer_size = 3  # Number of frames to buffer
+        self.buffer_size = 2  # Smaller buffer for lower latency
         self.motion_detected = False
         
         # GPU performance optimization settings
@@ -423,6 +525,26 @@ class YOLODetector:
         else:
             self.device = "cpu"
         print(f"[INFO] Using device: {self.device}")
+
+        # Face save configuration and recent frames buffer
+        self.face_save_dir = None
+        self.enable_face_save = False
+        self.recent_frames = deque(maxlen=15)
+        self.last_face_save_time = 0
+        self.face_save_cooldown = 5.0  # seconds
+        self.face_compare_limit = 20  # max existing images to compare (performance)
+        self.face_compare_extensions = {'.jpg', '.jpeg', '.png'}
+        # Background face save worker state
+        self.save_worker_busy = False
+        # DeepFace model cache (prepared asynchronously to avoid blocking detection loop)
+        self._df_model = None
+        self._df_module = None
+        self._df_model_ready = False
+        self._df_model_error = None
+        try:
+            self._prepare_deepface_model_async()
+        except Exception as e:
+            print(f"[WARNING] Failed to start DeepFace model preparation: {e}")
         
         # YOLO COCO class definitions
         self.class_names = {
@@ -460,6 +582,574 @@ class YOLODetector:
         else:
             print("[INFO] YOLO detection disabled")
             self.model = None
+
+    def set_face_save_dir(self, dir_path, enable=True):
+        try:
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+                self.face_save_dir = dir_path
+                self.enable_face_save = bool(enable)
+                print(f"[INFO] Face save directory set: {dir_path} (enabled={self.enable_face_save})")
+            else:
+                self.face_save_dir = None
+                self.enable_face_save = False
+        except Exception as e:
+            print(f"[ERROR] Failed to set face save dir: {e}")
+
+    def _capture_and_verify_faces(self, bbox):
+        """Capture up to 5 crops around the detected person and verify with DeepFace.
+        If they are the same person, keep one image and discard the rest.
+        Returns saved file path or None.
+        """
+        try:
+            if not self.enable_face_save or not self.face_save_dir:
+                return None
+
+            # Use recent frames to get temporal diversity
+            frames = list(self.recent_frames)[-5:]
+            if not frames:
+                return None
+
+            x1, y1, x2, y2 = map(int, bbox)
+            crops = []
+            for f in frames:
+                # Bound check
+                h, w = f.shape[:2]
+                x1c = max(0, min(w - 1, x1))
+                y1c = max(0, min(h - 1, y1))
+                x2c = max(0, min(w - 1, x2))
+                y2c = max(0, min(h - 1, y2))
+                if x2c <= x1c or y2c <= y1c:
+                    continue
+                crops.append(f[y1c:y2c, x1c:x2c].copy())
+
+            # Prefer 2+ crops for verification, but allow 1 for fallback
+            if len(crops) < 1:
+                return None
+
+            # Detect and focus on face regions within person crops for better verification
+            face_crops = []
+            try:
+                for c in crops:
+                    gray = cv2.cvtColor(c, cv2.COLOR_BGR2GRAY)
+                    faces = []
+                    try:
+                        # Use OpenCV Haar cascade if available
+                        if hasattr(self, 'face_cascade') and self.face_cascade is not None:
+                            faces = self.face_cascade.detectMultiScale(
+                                gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
+                            )
+                    except Exception:
+                        faces = []
+                    if isinstance(faces, (list, tuple)) and len(faces) > 0:
+                        # Choose largest detected face
+                        x, y, w, h = max(faces, key=lambda rect: rect[2] * rect[3])
+                        # Bound check inside crop
+                        x = max(0, min(x, c.shape[1] - 1))
+                        y = max(0, min(y, c.shape[0] - 1))
+                        w = max(1, min(w, c.shape[1] - x))
+                        h = max(1, min(h, c.shape[0] - y))
+                        face_crops.append(c[y:y + h, x:x + w].copy())
+                    else:
+                        # Fallback to the whole person crop if no face found
+                        face_crops.append(c)
+            except Exception:
+                # Any error in face detection, fallback to original crops
+                face_crops = crops
+
+            # Use prebuilt DeepFace model; skip if not ready to avoid blocking
+            if not self._df_model_ready or not self._df_module:
+                if self._df_model_error:
+                    print(f"[ERROR] DeepFace initialization failed: {self._df_model_error}")
+                else:
+                    print("[INFO] DeepFace model preparing in background; skipping save until ready")
+                return None
+            DeepFace = self._df_module
+
+            # Compare first crop to others
+            base = face_crops[0]
+            same_count = 0
+            total_comparisons = max(0, len(face_crops) - 1)
+            for i in range(1, len(face_crops)):
+                try:
+                    # Use API compatible with installed DeepFace: pass model_name instead of model object
+                    # Use mediapipe backend for robust face alignment across frames
+                    result = DeepFace.verify(base, face_crops[i], model_name='VGG-Face', detector_backend='mediapipe', enforce_detection=False)
+                    if result and result.get('verified'):
+                        same_count += 1
+                except Exception as ve:
+                    print(f"[WARNING] DeepFace verify error: {ve}")
+
+            # Use majority threshold instead of near-all to reduce false negatives
+            required = max(1, len(crops) // 2)
+            print(f"[INFO] DeepFace verification counts: same={same_count}, total={total_comparisons}, required={required}")
+            if same_count >= required:
+                # Check duplicates against existing saved faces before saving
+                try:
+                    if self._is_duplicate_face(base):
+                        print("[INFO] Duplicate face found in folder; skipping save")
+                        return None
+                except Exception as dupe_e:
+                    print(f"[WARNING] Duplicate check failed: {dupe_e}")
+                ts = time.strftime('%Y%m%d_%H%M%S')
+                filename = f"face_{ts}_{x1}_{y1}_{x2}_{y2}.jpg"
+                save_path = os.path.join(self.face_save_dir, filename)
+                try:
+                    cv2.imwrite(save_path, base)
+                    print(f"FACE_SAVED:{save_path}", flush=True)
+                    return save_path
+                except Exception as se:
+                    print(f"[ERROR] Failed to save face image: {se}")
+            else:
+                print("[INFO] DeepFace verification did not confirm same person; skipping save")
+
+        except Exception as e:
+            print(f"[ERROR] Face capture/verify failed: {e}")
+            return None
+
+    def _capture_and_verify_faces_from_frames(self, frames, bbox):
+        """Same as _capture_and_verify_faces but uses provided frames snapshot.
+        Runs DeepFace verification and duplicate check, saves unique face.
+        """
+        try:
+            if not self.enable_face_save or not self.face_save_dir:
+                return None
+
+            if not frames:
+                return None
+
+            x1, y1, x2, y2 = map(int, bbox)
+            crops = []
+            for f in frames:
+                h, w = f.shape[:2]
+                x1c = max(0, min(w - 1, x1))
+                y1c = max(0, min(h - 1, y1))
+                x2c = max(0, min(w - 1, x2))
+                y2c = max(0, min(h - 1, y2))
+                if x2c <= x1c or y2c <= y1c:
+                    continue
+                crops.append(f[y1c:y2c, x1c:x2c].copy())
+
+            if len(crops) < 1:
+                return None
+
+            # Detect and focus on face regions within person crops
+            face_crops = []
+            try:
+                for c in crops:
+                    gray = cv2.cvtColor(c, cv2.COLOR_BGR2GRAY)
+                    faces = []
+                    try:
+                        if hasattr(self, 'face_cascade') and self.face_cascade is not None:
+                            faces = self.face_cascade.detectMultiScale(
+                                gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
+                            )
+                    except Exception:
+                        faces = []
+                    if isinstance(faces, (list, tuple)) and len(faces) > 0:
+                        x, y, w, h = max(faces, key=lambda rect: rect[2] * rect[3])
+                        x = max(0, min(x, c.shape[1] - 1))
+                        y = max(0, min(y, c.shape[0] - 1))
+                        w = max(1, min(w, c.shape[1] - x))
+                        h = max(1, min(h, c.shape[0] - y))
+                        face_crops.append(c[y:y + h, x:x + w].copy())
+                    else:
+                        face_crops.append(c)
+            except Exception:
+                face_crops = crops
+
+            if not self._df_model_ready or not self._df_module:
+                if self._df_model_error:
+                    print(f"[ERROR] DeepFace initialization failed: {self._df_model_error}", flush=True)
+                else:
+                    print("EVENT_DF_PREPARING", flush=True)
+                return None
+            DeepFace = self._df_module
+
+            base = face_crops[0]
+            same_count = 0
+            total_comparisons = max(0, len(face_crops) - 1)
+            for i in range(1, len(face_crops)):
+                try:
+                    result = DeepFace.verify(base, face_crops[i], model_name='VGG-Face', detector_backend='mediapipe', enforce_detection=False)
+                    if result and result.get('verified'):
+                        same_count += 1
+                except Exception as ve:
+                    print(f"[WARNING] DeepFace verify error: {ve}", flush=True)
+
+            required = max(1, len(crops) // 2)
+            print(f"EVENT_VERIFICATION_COUNTS same={same_count} total={total_comparisons} required={required}", flush=True)
+            if same_count >= required:
+                try:
+                    if self._is_duplicate_face(base):
+                        print("EVENT_DUPLICATE_MATCH", flush=True)
+                        return None
+                except Exception as dupe_e:
+                    print(f"[WARNING] Duplicate check failed: {dupe_e}", flush=True)
+                ts = time.strftime('%Y%m%d_%H%M%S')
+                filename = f"face_{ts}_{x1}_{y1}_{x2}_{y2}.jpg"
+                save_path = os.path.join(self.face_save_dir, filename)
+                try:
+                    cv2.imwrite(save_path, base)
+                    print(f"FACE_SAVED:{save_path}", flush=True)
+                    return save_path
+                except Exception as se:
+                    print(f"[ERROR] Failed to save face image: {se}", flush=True)
+            else:
+                print("EVENT_VERIFICATION_REJECT", flush=True)
+
+        except Exception as e:
+            print(f"[ERROR] Face capture/verify (frames) failed: {e}", flush=True)
+            return None
+
+    def _enqueue_face_save_job(self, frames, bbox):
+        """Spawn a background worker to process face verification and saving."""
+        try:
+            if self.save_worker_busy:
+                return False
+            if not self.enable_face_save or not self.face_save_dir:
+                return False
+            if not frames or len(frames) < 5:
+                print(f"EVENT_FACE_JOB_SKIPPED_INSUFFICIENT_FRAMES count={len(frames) if frames else 0}", flush=True)
+                return False
+            self.save_worker_busy = True
+            import threading
+            print(f"EVENT_FACE_JOB_ENQUEUED frames={len(frames)} bbox={bbox}", flush=True)
+            def _worker():
+                try:
+                    print("EVENT_FACE_JOB_START", flush=True)
+                    saved = self._capture_and_verify_faces_from_frames(frames, bbox)
+                    if saved:
+                        print(f"EVENT_FACE_JOB_DONE saved={saved}", flush=True)
+                    else:
+                        print("EVENT_FACE_JOB_DONE saved=None", flush=True)
+                finally:
+                    self.save_worker_busy = False
+            t = threading.Thread(target=_worker, name="face-save-worker", daemon=True)
+            t.start()
+            return True
+        except Exception as e:
+            self.save_worker_busy = False
+            print(f"[ERROR] Failed to enqueue face save job: {e}", flush=True)
+            return False
+
+    # -------------------------------------------------------------
+    # Foresight per-track 5-frame pipeline (IoU/centroid tracker)
+    # -------------------------------------------------------------
+    def _init_foresight_tracking(self):
+        if not hasattr(self, 'fs_tracks'):
+            self.fs_tracks = {}
+            self.fs_frames_seen = {}
+            self.fs_burst_buf = {}
+            self.fs_next_track_id = 1
+
+    def _bbox_from_detection(self, d):
+        try:
+            if 'coords' in d:
+                x1, y1, x2, y2 = map(int, d['coords'])
+                return (x1, y1, x2, y2)
+            else:
+                x1 = int(d.get('x1', 0)); y1 = int(d.get('y1', 0))
+                x2 = int(d.get('x2', 0)); y2 = int(d.get('y2', 0))
+                return (x1, y1, x2, y2)
+        except Exception:
+            return None
+
+    def _is_person_detection(self, d):
+        try:
+            if 'coords' in d:
+                cls_id = int(d.get('cls', 0))
+                label = self.get_class_name(cls_id)
+                return (label or '').lower() == 'person'
+            else:
+                label = (d.get('label') or '').lower()
+                return label == 'person'
+        except Exception:
+            return False
+
+    def _iou(self, b1, b2):
+        try:
+            x1, y1, x2, y2 = b1
+            x1b, y1b, x2b, y2b = b2
+            ix1 = max(x1, x1b); iy1 = max(y1, y1b)
+            ix2 = min(x2, x2b); iy2 = min(y2, y2b)
+            iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
+            inter = iw * ih
+            area1 = max(0, x2 - x1) * max(0, y2 - y1)
+            area2 = max(0, x2b - x1b) * max(0, y2b - y1b)
+            union = area1 + area2 - inter
+            if union <= 0:
+                return 0.0
+            return inter / union
+        except Exception:
+            return 0.0
+
+    def _centroid(self, b):
+        x1, y1, x2, y2 = b
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+    def _assign_or_create_track(self, bbox):
+        self._init_foresight_tracking()
+        best_tid, best_iou = None, 0.0
+        for tid, t in self.fs_tracks.items():
+            i = self._iou(bbox, t['bbox'])
+            if i > best_iou:
+                best_tid, best_iou = tid, i
+        if best_tid is not None and best_iou >= 0.3:
+            self.fs_tracks[best_tid]['bbox'] = bbox
+            return best_tid, bbox
+        cx, cy = self._centroid(bbox)
+        best_tid, best_dist = None, 1e9
+        for tid, t in self.fs_tracks.items():
+            tcx, tcy = self._centroid(t['bbox'])
+            dist = (tcx - cx) ** 2 + (tcy - cy) ** 2
+            if dist < best_dist:
+                best_tid, best_dist = tid, dist
+        if best_tid is not None and best_dist <= (50 ** 2):
+            self.fs_tracks[best_tid]['bbox'] = bbox
+            return best_tid, bbox
+        tid = self.fs_next_track_id
+        self.fs_next_track_id += 1
+        self.fs_tracks[tid] = { 'bbox': bbox, 'last_seen': time.time() }
+        self.fs_frames_seen[tid] = 0
+        self.fs_burst_buf.setdefault(tid, [])
+        return tid, bbox
+
+    def _on_detection(self, tid, frame, bbox):
+        self._init_foresight_tracking()
+        c = self.fs_frames_seen.get(tid, 0) + 1
+        self.fs_frames_seen[tid] = c
+        buf = self.fs_burst_buf.setdefault(tid, [])
+        buf.append((frame.copy(), bbox))
+        # Diagnostic trace after counting frames
+        print(f"{LOG_PREFIX} [TRACE][{tid}] frames={c}", flush=True)
+        if c >= FRAMES_REQUIRED:
+            def _job():
+                try:
+                    self._run_face_job(tid, buf[:FRAMES_REQUIRED])
+                except Exception as e:
+                    print(f"{LOG_PREFIX}[FACE_JOB][{tid}]ERR:{e!r}", flush=True)
+                finally:
+                    try:
+                        self.fs_burst_buf[tid].clear()
+                        self.fs_frames_seen[tid] = 0
+                    except Exception:
+                        pass
+            try:
+                import threading
+                threading.Thread(target=_job, name=f"fs-face-job-{tid}", daemon=True).start()
+            except Exception as e:
+                print(f"{LOG_PREFIX}[FACE_JOB][{tid}]thread_err:{e!r}", flush=True)
+
+    # Public diagnostic wrapper to confirm calls and catch errors
+    def on_detection(self, track_id, frame, bbox):
+        try:
+            print(f"{LOG_PREFIX} on_detection CALLED for track_id={track_id}", flush=True)
+            self._on_detection(track_id, frame, bbox)
+        except Exception as e:
+            print(f"{LOG_PREFIX} [on_detection ERROR] {e}", flush=True)
+
+    def _run_face_job(self, tid, frames_burst):
+        print(f"{LOG_PREFIX}[FACE_JOB][{tid}]start;burst={len(frames_burst)}", flush=True)
+        # Non-blocking loading indicator
+        try:
+            show_loading(True)
+        except Exception as _e:
+            print(f"{LOG_PREFIX}[UI] show_loading_err:{_e}", flush=True)
+        faces = []
+        for i, (f, b) in enumerate(frames_burst):
+            try:
+                x1, y1, x2, y2 = map(int, b)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(f.shape[1], x2), min(f.shape[0], y2)
+                crop = f[y1:y2, x1:x2]
+                if crop.shape[0] < MIN_FACE_SIZE or crop.shape[1] < MIN_FACE_SIZE:
+                    continue
+                try:
+                    from deepface import DeepFace
+                    os.makedirs(r"C:\Users\Asus\.deepface\weights", exist_ok=True)
+                    print("[FORESIGHT][DeepFace] Running comparison...")
+                    fc = DeepFace.extract_faces(img_path=crop, detector_backend=FACE_DETECTOR_BACKEND, enforce_detection=False)
+                    if fc:
+                        faces.append((fc[0]["face"] * 255).astype("uint8"))
+                except Exception as e:
+                    msg = str(e)
+                    if "arcface_weights.h5" in msg.lower():
+                        print("[FORESIGHT][DeepFace] Missing weights. Place file at C:\\Users\\Asus\\.deepface\\weights\\arcface_weights.h5", flush=True)
+                    print(f"{LOG_PREFIX}[FACE_JOB][{tid}]extracterr:{repr(e)}", flush=True)
+            except Exception:
+                continue
+        if not faces:
+            print(f"{LOG_PREFIX}[FACE_JOB][{tid}]no_faces", flush=True)
+            try:
+                show_loading(False)
+            except Exception as _e:
+                print(f"{LOG_PREFIX}[UI] hide_loading_err:{_e}", flush=True)
+            return
+        rep = faces[min(2, len(faces) - 1)]
+        if FORCE_ALWAYS_SAVE or BYPASS_DEEPFACE:
+            self._save_rep(tid, rep, "BYPASS" if BYPASS_DEEPFACE else "FORCE")
+            try:
+                show_loading(False)
+            except Exception as _e:
+                print(f"{LOG_PREFIX}[UI] hide_loading_err:{_e}", flush=True)
+            return
+        seen = self._check_in_db(rep)
+        print(f"{LOG_PREFIX}[FACE_JOB][{tid}]seen?{seen}", flush=True)
+        if not seen:
+            self._save_rep(tid, rep, "NEW")
+        else:
+            print(f"{LOG_PREFIX}[FACE_JOB][{tid}]skip(existing)", flush=True)
+        try:
+            show_loading(False)
+        except Exception as _e:
+            print(f"{LOG_PREFIX}[UI] hide_loading_err:{_e}", flush=True)
+
+    def _save_rep(self, tid, img, tag="NEW"):
+        fn = f"{int(time.time())}_{tid}_{uuid.uuid4().hex}.jpg"
+        p = os.path.join(SAVE_DIR, fn)
+        try:
+            ok = cv2.imwrite(p, img)
+        except Exception:
+            ok = False
+        print(f"{LOG_PREFIX}[SAVE][{tag}][{tid}]>{p}ok={ok}", flush=True)
+        if ok:
+            try:
+                cv2.imwrite(os.path.join(DB_DIR, fn), img)
+                print(f"FACE_SAVED:{p}", flush=True)
+            except Exception as e:
+                print(f"{LOG_PREFIX}[DB_SAVE][{tid}]err:{e}", flush=True)
+
+    def _check_in_db(self, img):
+        tmp = os.path.join(SAVE_DIR, "_tmp.jpg")
+        try:
+            cv2.imwrite(tmp, img)
+            from deepface import DeepFace
+            os.makedirs(r"C:\Users\Asus\.deepface\weights", exist_ok=True)
+            print("[FORESIGHT][DeepFace] Running comparison...")
+            try:
+                r = DeepFace.find(img_path=tmp, db_path=DB_DIR, model_name=DEEPFACE_MODEL,
+                                  detector_backend=FACE_DETECTOR_BACKEND, distance_metric=DEEPFACE_METRIC,
+                                  enforce_detection=False, silent=True)
+            except Exception as e:
+                msg = str(e)
+                if "arcface_weights.h5" in msg.lower():
+                    print("[FORESIGHT][DeepFace] Missing weights. Place file at C:\\Users\\Asus\\.deepface\\weights\\arcface_weights.h5", flush=True)
+                print(f"{LOG_PREFIX}[DB]err:{repr(e)}", flush=True)
+                return False
+            if not r or getattr(r[0], 'empty', False):
+                return False
+            df = r[0]
+            col = None
+            for c in df.columns:
+                if str(c).endswith(DEEPFACE_METRIC):
+                    col = c; break
+            if not col:
+                return False
+            try:
+                d = float(df.iloc[0][col])
+                print(f"{LOG_PREFIX}[DB]dist={d:.3f}thr={DEEPFACE_THRESH}", flush=True)
+                return d <= DEEPFACE_THRESH
+            except Exception:
+                return False
+        except Exception as e:
+            print(f"{LOG_PREFIX}[DB]err:{e}", flush=True)
+            return False
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+    def _is_duplicate_face(self, candidate_img):
+        """Compare candidate image to existing images in face_save_dir using DeepFace.
+        Returns True if any verified match is found, False otherwise.
+        """
+        try:
+            if not self.face_save_dir:
+                return False
+            if not self._df_model_ready or not self._df_module:
+                # If DeepFace is not ready yet, skip duplicate check (avoid blocking)
+                return False
+            DeepFace = self._df_module
+            # Collect existing image paths
+            files = []
+            for name in os.listdir(self.face_save_dir):
+                ext = os.path.splitext(name)[1].lower()
+                if ext in self.face_compare_extensions:
+                    files.append(os.path.join(self.face_save_dir, name))
+            if not files:
+                return False
+            # Sort by modification time desc and limit
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            files = files[: self.face_compare_limit]
+            matches = 0
+            compared = 0
+            for path in files:
+                try:
+                    img = cv2.imread(path)
+                    if img is None:
+                        continue
+                    compared += 1
+                    # Use API compatible with installed DeepFace
+                    # Use mediapipe backend for folder comparisons as well
+                    res = DeepFace.verify(candidate_img, img, model_name='VGG-Face', detector_backend='mediapipe', enforce_detection=False)
+                    if res and res.get('verified'):
+                        matches += 1
+                        # One match is enough to mark as duplicate
+                        print(f"[INFO] Folder duplicate matched: {os.path.basename(path)}")
+                        print(f"[INFO] DeepFace folder compare: compared={compared}, matches={matches}")
+                        return True
+                except Exception as e:
+                    # Ignore per-file errors, continue
+                    pass
+            print(f"[INFO] DeepFace folder compare: compared={compared}, matches={matches}")
+            return False
+        except Exception as e:
+            print(f"[WARNING] Duplicate check error: {e}")
+            return False
+
+    def _prepare_deepface_model_async(self):
+        """Prepare the DeepFace model in a background thread to avoid blocking detection."""
+        import threading
+
+        def _worker():
+            try:
+                print("[INFO] Preparing DeepFace model in background (first run may download ~580MB)")
+                # Patch TensorFlow __version__ if missing before importing DeepFace
+                try:
+                    import tensorflow as tf
+                    if not hasattr(tf, "__version__") or tf.__version__ is None:
+                        try:
+                            import importlib.metadata as im
+                            ver = None
+                            for d in ("tensorflow", "tensorflow-intel"):
+                                try:
+                                    ver = im.version(d)
+                                    if ver:
+                                        break
+                                except Exception:
+                                    pass
+                            setattr(tf, "__version__", ver or "2.15.1")
+                        except Exception:
+                            setattr(tf, "__version__", "2")
+                except Exception:
+                    pass
+
+                from deepface import DeepFace
+                # Build and cache the model once
+                model = DeepFace.build_model("VGG-Face")
+                self._df_model = model
+                self._df_module = DeepFace
+                self._df_model_ready = True
+                print("[INFO] DeepFace model ready", flush=True)
+            except Exception as e:
+                self._df_model_error = e
+                self._df_model_ready = False
+                print(f"[ERROR] DeepFace model preparation failed: {e}")
+
+        t = threading.Thread(target=_worker, name="deepface-prep", daemon=True)
+        t.start()
     
     def initialize_model(self):
         """Initialize YOLO model exactly like reference code with Windows workarounds"""
@@ -553,94 +1243,116 @@ class YOLODetector:
             
             # Process every frame for real-time detection (removed FPS throttling)
             
-            # Run YOLO inference with maximum speed optimizations
-            # Aggressive frame resizing for real-time performance
+            # Enhanced multi-scale detection for improved detection rate
             height, width = frame.shape[:2]
-            # Use smaller resolution for maximum speed (320px for real-time)
-            target_size = 320  # Smaller size for faster processing
-            if width > target_size or height > target_size:
-                if width > height:
-                    scale = target_size / width
-                    new_width = target_size
-                    new_height = int(height * scale)
-                else:
-                    scale = target_size / height
-                    new_height = target_size
-                    new_width = int(width * scale)
-                frame_resized = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-            else:
-                frame_resized = frame
-                scale = 1.0
             
-            # Use model.track() with maximum GPU performance optimization
-            try:
-                if self.device == "cuda":
-                    # Maximum GPU performance tracking with FP16 and smaller image size
-                    results = self.model.track(
-                        frame_resized,
-                        persist=True,
-                        tracker='bytetrack.yaml',
-                        conf=self.confidence_threshold,
-                        iou=0.3,  # Lower IoU to allow overlapping detections in crowds
-                        verbose=False,
-                        imgsz=320,  # Smaller size for real-time processing
-                        half=True,  # Use FP16 for maximum speed
-                        device=self.device,
-                        max_det=100  # Increase max detections for crowds
-                    )
-                else:
-                    results = self.model.track(
-                        frame_resized,
-                        persist=True,
-                        tracker='bytetrack.yaml',
-                        conf=self.confidence_threshold,
-                        iou=0.3,  # Lower IoU for crowd detection
-                        verbose=False,
-                        imgsz=320,  # Smaller size for real-time processing
-                        max_det=100  # Increase max detections for crowds
-                    )
-            except:
-                # Fallback to regular detection with GPU optimization
-                if self.device == "cuda":
-                    results = self.model(frame_resized, conf=self.confidence_threshold, verbose=False, show=False, imgsz=320, half=True, device=self.device, max_det=100)
-                else:
-                    results = self.model(frame_resized, conf=self.confidence_threshold, verbose=False, show=False, imgsz=320, max_det=100)
+            # Multi-scale detection: try different resolutions for better coverage
+            detection_scales = [640, 416]  # Multiple scales for better detection
+            all_detections = []
             
-            detections = []
-            # Get first result (like reference code: results[0])
-            if results and len(results) > 0:
-                result = results[0]
-                boxes = result.boxes
-                if boxes is not None:
-                    for box in boxes:
-                        # Get box coordinates
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        confidence = box.conf[0].cpu().numpy()
-                        class_id = int(box.cls[0].cpu().numpy())
-                        
-                        # Get tracking ID if available
-                        track_id = None
-                        if hasattr(box, 'id') and box.id is not None:
-                            track_id = int(box.id[0].cpu().numpy())
-                        
-                        # Scale coordinates back to original frame size
-                        if scale != 1.0:
-                            x1 = x1 / scale
-                            y1 = y1 / scale
-                            x2 = x2 / scale
-                            y2 = y2 / scale
-                        
-                        # Get class name from YOLO's built-in names (like reference)
-                        class_name = self.model.names[class_id] if class_id in self.model.names else f'class_{class_id}'
-                        
-                        detection = {
-                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                            'confidence': float(confidence),
-                            'class_id': class_id,
-                            'label': class_name,
-                            'track_id': track_id
-                        }
-                        detections.append(detection)
+            for target_size in detection_scales:
+                if width > target_size or height > target_size:
+                    if width > height:
+                        scale = target_size / width
+                        new_width = target_size
+                        new_height = int(height * scale)
+                    else:
+                        scale = target_size / height
+                        new_height = target_size
+                        new_width = int(width * scale)
+                    frame_resized = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                else:
+                    frame_resized = frame
+                    scale = 1.0
+                
+                # Enhanced preprocessing for better detection
+                # Apply histogram equalization for better contrast
+                frame_enhanced = cv2.convertScaleAbs(frame_resized, alpha=1.1, beta=10)
+                
+                # Use the enhanced frame for detection
+                frame_to_detect = frame_enhanced
+            
+                # Enhanced detection with improved NMS settings
+                try:
+                    if self.device == "cuda":
+                        # Enhanced GPU tracking with lower IoU for better detection coverage
+                        results = self.model.track(
+                            frame_to_detect,
+                            persist=True,
+                            tracker='bytetrack.yaml',
+                            conf=self.confidence_threshold,
+                            iou=0.3,  # Lower IoU for better detection of partial/overlapping humans
+                            verbose=False,
+                            imgsz=target_size,
+                            half=True,
+                            device=self.device,
+                            max_det=100,  # Increased for better coverage
+                            classes=[0],  # Only detect persons
+                            agnostic_nms=True,
+                            augment=True  # Enable test-time augmentation for better detection
+                        )
+                    else:
+                        results = self.model.track(
+                            frame_to_detect,
+                            persist=True,
+                            tracker='bytetrack.yaml',
+                            conf=self.confidence_threshold,
+                            iou=0.3,  # Lower IoU for better detection coverage
+                            verbose=False,
+                            imgsz=target_size,
+                            max_det=100,
+                            classes=[0],
+                            agnostic_nms=True,
+                            augment=True
+                        )
+                except:
+                    # Enhanced fallback detection
+                    if self.device == "cuda":
+                        results = self.model(frame_to_detect, conf=self.confidence_threshold, verbose=False, show=False, imgsz=target_size, half=True, device=self.device, max_det=100, classes=[0], agnostic_nms=True, augment=True)
+                    else:
+                        results = self.model(frame_to_detect, conf=self.confidence_threshold, verbose=False, show=False, imgsz=target_size, max_det=100, classes=[0], agnostic_nms=True, augment=True)
+            
+                scale_detections = []
+                # Process results from current scale
+                if results and len(results) > 0:
+                    result = results[0]
+                    boxes = result.boxes
+                    if boxes is not None:
+                        for box in boxes:
+                            # Get box coordinates
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            confidence = box.conf[0].cpu().numpy()
+                            class_id = int(box.cls[0].cpu().numpy())
+                            
+                            # Get tracking ID if available
+                            track_id = None
+                            if hasattr(box, 'id') and box.id is not None:
+                                track_id = int(box.id[0].cpu().numpy())
+                            
+                            # Scale coordinates back to original frame size
+                            if scale != 1.0:
+                                x1 = x1 / scale
+                                y1 = y1 / scale
+                                x2 = x2 / scale
+                                y2 = y2 / scale
+                            
+                            # Get class name from YOLO's built-in names
+                            class_name = self.model.names[class_id] if class_id in self.model.names else f'class_{class_id}'
+                            
+                            detection = {
+                                'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                'confidence': float(confidence),
+                                'class_id': class_id,
+                                'label': class_name,
+                                'track_id': track_id,
+                                'scale': target_size
+                            }
+                            scale_detections.append(detection)
+                
+                all_detections.extend(scale_detections)
+            
+            # Merge and deduplicate detections from multiple scales
+            detections = self._merge_multi_scale_detections(all_detections)
             
             self.last_detections = detections
             self.last_inference_time = current_time
@@ -649,6 +1361,62 @@ class YOLODetector:
         except Exception as e:
             print(f"[ERROR] Detection failed: {e}")
             return getattr(self, 'last_detections', [])
+    
+    def _merge_multi_scale_detections(self, all_detections):
+        """Merge detections from multiple scales, removing duplicates and keeping best confidence"""
+        if not all_detections:
+            return []
+        
+        # Group detections by overlap (IoU > 0.5 means same object)
+        merged_detections = []
+        used_indices = set()
+        
+        for i, det1 in enumerate(all_detections):
+            if i in used_indices:
+                continue
+                
+            # Find all overlapping detections
+            overlapping = [det1]
+            used_indices.add(i)
+            
+            for j, det2 in enumerate(all_detections[i+1:], i+1):
+                if j in used_indices:
+                    continue
+                    
+                # Calculate IoU between bounding boxes
+                iou = self._calculate_iou(det1['bbox'], det2['bbox'])
+                if iou > 0.5:  # Same object detected at different scales
+                    overlapping.append(det2)
+                    used_indices.add(j)
+            
+            # Keep detection with highest confidence
+            best_detection = max(overlapping, key=lambda x: x['confidence'])
+            merged_detections.append(best_detection)
+        
+        return merged_detections
+    
+    def _calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union (IoU) of two bounding boxes"""
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Calculate intersection area
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # Calculate union area
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
     
     def detect(self, frame):
         """Simple YOLO detection matching reference code behavior"""
@@ -914,6 +1682,11 @@ class YOLODetector:
             return frame, []
             
         try:
+            # Maintain recent frames buffer
+            try:
+                self.recent_frames.append(frame.copy())
+            except Exception:
+                pass
             # Initialize frame buffering, motion detection and TTL persistence (ChatGPT anti-flicker fix)
             if not hasattr(self, 'data_frame_buffer'):
                 self.data_frame_buffer = []
@@ -1015,6 +1788,16 @@ class YOLODetector:
                     if detection_data:
                         import json
                         print(f"DETECTION_DATA:{json.dumps(detection_data)}", flush=True)
+
+                        # Legacy cooldown-based face save flow disabled; using per-track 5-frame pipeline
+                        # if False:
+                        #     now = time.time()
+                        #     if self.enable_face_save and (now - self.last_face_save_time) >= self.face_save_cooldown:
+                        #         first = detection_data[0]
+                        #         bbox = (first['x1'], first['y1'], first['x2'], first['y2'])
+                        #         frames_snapshot = list(self.recent_frames)[-5:]
+                        #         if self._enqueue_face_save_job(frames_snapshot, bbox):
+                        #             self.last_face_save_time = now
                     
                     # Update TTL cache with new detections
                     self.last_boxes = detection_data
@@ -1145,22 +1928,42 @@ class YOLODetector:
 class ScreenCapture:
     def __init__(self, region=None):
         self.region = region  # (x, y, width, height)
+        # Performance optimizations
+        self.cached_monitor = None
+        self.frame_buffer = None
+        self.last_dimensions = None
         
     def capture_screen(self):
-        """Capture screen or specific region"""
+        """Optimized screen capture with caching for real-time performance"""
         try:
             import mss
             
-            with mss.mss() as sct:
+            # Cache monitor configuration for better performance
+            if self.cached_monitor is None:
                 if self.region:
                     x, y, width, height = self.region
-                    monitor = {"top": y, "left": x, "width": width, "height": height}
+                    self.cached_monitor = {"top": y, "left": x, "width": width, "height": height}
                 else:
-                    monitor = sct.monitors[1]  # Primary monitor
+                    with mss.mss() as sct:
+                        self.cached_monitor = sct.monitors[1]  # Primary monitor
+            
+            with mss.mss() as sct:
+                screenshot = sct.grab(self.cached_monitor)
                 
-                screenshot = sct.grab(monitor)
-                frame = np.array(screenshot)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                # Get current dimensions
+                current_dims = (screenshot.height, screenshot.width)
+                
+                # Pre-allocate buffer if needed
+                if self.last_dimensions != current_dims or self.frame_buffer is None:
+                    self.frame_buffer = np.empty((screenshot.height, screenshot.width, 4), dtype='uint8')
+                    self.last_dimensions = current_dims
+                
+                # Convert screenshot data to numpy array
+                frame_data = np.frombuffer(screenshot.bgra, dtype='uint8')
+                self.frame_buffer = frame_data.reshape((screenshot.height, screenshot.width, 4))
+                
+                # Optimized color conversion
+                frame = cv2.cvtColor(self.frame_buffer, cv2.COLOR_BGRA2BGR)
                 
                 return frame
         except ImportError:
@@ -1171,7 +1974,7 @@ class ScreenCapture:
             return None
 
 class WindowOverlay:
-    def __init__(self, window_title="Argus Phone Mirror"):
+    def __init__(self, window_title="Foresight Phone Mirror"):
         self.window_title = window_title
         self.hwnd = None
         self.overlay_hwnd = None
@@ -1303,6 +2106,46 @@ class WindowOverlay:
             
         except Exception as e:
             print(f"[ERROR] Failed to draw on window: {e}")
+
+    def draw_loading_message(self, message="Analyzing faces..."):
+        """Draw a bottom-centered loading message on the target window."""
+        if not self.hwnd:
+            return
+        try:
+            import win32gui
+            import win32con
+            import win32api
+            # Acquire DC and set transparent background
+            hdc = win32gui.GetWindowDC(self.hwnd)
+            win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+            win32gui.SetTextColor(hdc, win32api.RGB(255, 255, 0))  # Yellow text
+            # Compute bottom-center rect
+            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+            width = right - left
+            height = bottom - top
+            rect = (int(width * 0.25), int(height - 40), int(width * 0.75), int(height - 10))
+            # Centered single line text
+            flags = win32con.DT_CENTER | win32con.DT_SINGLELINE
+            win32gui.DrawText(hdc, message, -1, rect, flags)
+            win32gui.ReleaseDC(self.hwnd, hdc)
+        except Exception as e:
+            print(f"[ERROR] Failed to draw loading message: {e}")
+
+    def clear_loading_message(self):
+        """Request the target window to redraw, clearing overlay text."""
+        if not self.hwnd:
+            return
+        try:
+            import win32gui
+            import win32con
+            win32gui.RedrawWindow(
+                self.hwnd,
+                None,
+                None,
+                win32con.RDW_INVALIDATE | win32con.RDW_ERASE | win32con.RDW_ALLCHILDREN,
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to clear loading message: {e}")
     
     def cleanup(self):
         """Clean up overlay window"""
@@ -1314,32 +2157,32 @@ class WindowOverlay:
             self.overlay_hwnd = None
 
 class WindowCapture:
-    def __init__(self, window_title="Argus Phone Mirror"):
+    def __init__(self, window_title="Foresight Phone Mirror"):
         self.window_title = window_title
         self.hwnd = None
+        # Performance optimizations
+        self.cached_dc = None
+        self.cached_bitmap = None
+        self.cached_dimensions = None
+        self.frame_buffer = None
         
     def find_window(self):
         """Find window by title"""
         try:
-            import win32gui
-            import win32con
-            
-            def enum_windows_callback(hwnd, windows):
-                if win32gui.IsWindowVisible(hwnd) and self.window_title in win32gui.GetWindowText(hwnd):
-                    windows.append(hwnd)
-                return True
-            
-            windows = []
-            win32gui.EnumWindows(enum_windows_callback, windows)
-            
-            if windows:
-                self.hwnd = windows[0]
-                print(f"[INFO] Found window: {win32gui.GetWindowText(self.hwnd)}")
+            global SCRCPY_HWND
+            hwnd = get_hwnd_by_title_substr(self.window_title)
+            if hwnd and is_valid_hwnd(hwnd):
+                SCRCPY_HWND = hwnd
+                self.hwnd = hwnd
+                try:
+                    title = win32gui.GetWindowText(hwnd)
+                    print(f"[INFO] Found window: {title}")
+                except Exception:
+                    print("[INFO] Found window")
                 return True
             else:
                 print(f"[WARNING] Window '{self.window_title}' not found")
                 return False
-                
         except ImportError:
             print("[ERROR] pywin32 library not found. Install with: pip install pywin32")
             return False
@@ -1348,48 +2191,104 @@ class WindowCapture:
             return False
     
     def capture_window(self):
-        """Capture window content"""
-        if not self.hwnd:
-            if not self.find_window():
+        """Optimized window capture with caching for real-time performance"""
+        global SCRCPY_HWND, SCRCPY_LAST_OK, SCRCPY_OK_CONSEC
+        global _WIN_INVALID_LOG_LAST, _WIN_WAIT_LOG_LAST, _WIN_GETRECT_ERR_LAST
+        # Ensure we have a valid hwnd; handle first-capture and reacquisition paths
+        first_boot = SCRCPY_LAST_OK == 0.0
+        if not SCRCPY_HWND or not is_valid_hwnd(SCRCPY_HWND):
+            now = time.time()
+            if now - _WIN_INVALID_LOG_LAST > 2.0:
+                print("[FORESIGHT][WIN] handle invalid; re-acquiring…")
+                _WIN_INVALID_LOG_LAST = now
+            max_attempts = 30 if first_boot else 50
+            for _ in range(max_attempts):
+                hwnd = get_hwnd_by_title_substr(WINDOW_TITLE_SUBSTR)
+                if hwnd and is_valid_hwnd(hwnd):
+                    try:
+                        SCRCPY_HWND = hwnd
+                        self.hwnd = hwnd
+                        if not first_boot:
+                            print("[FORESIGHT][WIN] reacquired handle")
+                        if first_boot:
+                            time.sleep(0.5)
+                        # Confirm rect once before proceeding
+                        left, top, right, bottom = win32gui.GetWindowRect(SCRCPY_HWND)
+                        SCRCPY_LAST_OK = time.time()
+                        SCRCPY_OK_CONSEC = 1
+                        break
+                    except Exception:
+                        SCRCPY_HWND = None
+                        self.hwnd = None
+                else:
+                    t2 = time.time()
+                    if t2 - _WIN_WAIT_LOG_LAST > 3.0:
+                        print("[FORESIGHT][WIN] still waiting for scrcpy window…")
+                        _WIN_WAIT_LOG_LAST = t2
+                time.sleep(0.2)
+            if not SCRCPY_HWND:
                 return None
-                
+        else:
+            # Keep self.hwnd in sync
+            self.hwnd = SCRCPY_HWND
+        
         try:
             import win32gui
             import win32ui
             import win32con
             
             # Get window dimensions
-            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+            try:
+                left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+                SCRCPY_LAST_OK = time.time()
+                SCRCPY_OK_CONSEC = min(SCRCPY_OK_CONSEC + 1, 3)
+            except Exception as e:
+                now = time.time()
+                if now - _WIN_GETRECT_ERR_LAST > 2.5:
+                    print(f"[FORESIGHT][WIN] GetWindowRect error: {repr(e)}")
+                    _WIN_GETRECT_ERR_LAST = now
+                # Invalidate and skip this frame; reacquire next time
+                SCRCPY_HWND = None
+                self.hwnd = None
+                return None
             width = right - left
             height = bottom - top
-            # print(f"[DEBUG] Window capture dimensions: {width}x{height}", flush=True)
+            current_dimensions = (width, height)
             
-            # Get window device context
-            hwndDC = win32gui.GetWindowDC(self.hwnd)
-            mfcDC = win32ui.CreateDCFromHandle(hwndDC)
-            saveDC = mfcDC.CreateCompatibleDC()
+            # Check if we need to recreate cached resources
+            if (self.cached_dimensions != current_dimensions or 
+                self.cached_dc is None or self.cached_bitmap is None):
+                
+                # Clean up old resources
+                self._cleanup_cache()
+                
+                # Create new cached resources
+                hwndDC = win32gui.GetWindowDC(self.hwnd)
+                self.mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+                self.cached_dc = self.mfcDC.CreateCompatibleDC()
+                
+                self.cached_bitmap = win32ui.CreateBitmap()
+                self.cached_bitmap.CreateCompatibleBitmap(self.mfcDC, width, height)
+                self.cached_dc.SelectObject(self.cached_bitmap)
+                
+                self.cached_dimensions = current_dimensions
+                self.hwndDC = hwndDC
+                
+                # Pre-allocate frame buffer for better performance
+                self.frame_buffer = np.empty((height, width, 4), dtype='uint8')
             
-            # Create bitmap
-            saveBitMap = win32ui.CreateBitmap()
-            saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
-            saveDC.SelectObject(saveBitMap)
+            # Fast capture using cached resources
+            self.cached_dc.BitBlt((0, 0), (width, height), self.mfcDC, (0, 0), win32con.SRCCOPY)
             
-            # Copy window content
-            saveDC.BitBlt((0, 0), (width, height), mfcDC, (0, 0), win32con.SRCCOPY)
+            # Optimized bitmap data extraction
+            bmpstr = self.cached_bitmap.GetBitmapBits(True)
             
-            # Convert to numpy array
-            bmpinfo = saveBitMap.GetInfo()
-            bmpstr = saveBitMap.GetBitmapBits(True)
+            # Convert bitmap data to numpy array
+            frame_data = np.frombuffer(bmpstr, dtype='uint8')
+            self.frame_buffer = frame_data.reshape((height, width, 4))
             
-            frame = np.frombuffer(bmpstr, dtype='uint8')
-            frame.shape = (height, width, 4)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            
-     
-            win32gui.DeleteObject(saveBitMap.GetHandle())
-            saveDC.DeleteDC()
-            mfcDC.DeleteDC()
-            win32gui.ReleaseDC(self.hwnd, hwndDC)
+            # Fast color conversion
+            frame = cv2.cvtColor(self.frame_buffer, cv2.COLOR_BGRA2BGR)
             
             return frame
             
@@ -1398,18 +2297,66 @@ class WindowCapture:
             return None
         except Exception as e:
             print(f"[ERROR] Window capture failed: {e}")
+            self._cleanup_cache()  # Clean up on error
             return None
+    
+    def _cleanup_cache(self):
+        """Clean up cached resources"""
+        try:
+            if hasattr(self, 'cached_bitmap') and self.cached_bitmap:
+                win32gui.DeleteObject(self.cached_bitmap.GetHandle())
+            if hasattr(self, 'cached_dc') and self.cached_dc:
+                self.cached_dc.DeleteDC()
+            if hasattr(self, 'mfcDC') and self.mfcDC:
+                self.mfcDC.DeleteDC()
+            if hasattr(self, 'hwndDC') and self.hwndDC:
+                win32gui.ReleaseDC(self.hwnd, self.hwndDC)
+        except:
+            pass  # Ignore cleanup errors
+        
+        self.cached_dc = None
+        self.cached_bitmap = None
+        self.cached_dimensions = None
+    
+    def __del__(self):
+        """Destructor to clean up resources"""
+        self._cleanup_cache()
+
+def show_loading(active: bool, message: str = "Analyzing faces..."):
+    """Helper to show or hide a non-blocking loading indicator.
+    Uses overlay if available, otherwise prints to console.
+    """
+    try:
+        if active:
+            print(f"{LOG_PREFIX} [UI] {message}", flush=True)
+            if GLOBAL_WINDOW_OVERLAY:
+                try:
+                    GLOBAL_WINDOW_OVERLAY.draw_loading_message(message)
+                except Exception as e:
+                    print(f"{LOG_PREFIX} [UI] draw_loading_err: {e}", flush=True)
+        else:
+            print(f"{LOG_PREFIX} [UI] Loading complete", flush=True)
+            if GLOBAL_WINDOW_OVERLAY:
+                try:
+                    GLOBAL_WINDOW_OVERLAY.clear_loading_message()
+                except Exception as e:
+                    print(f"{LOG_PREFIX} [UI] clear_loading_err: {e}", flush=True)
+    except Exception as e:
+        print(f"{LOG_PREFIX} [UI] show_loading_err: {e}", flush=True)
 
 def main():
-    parser = argparse.ArgumentParser(description='Argus YOLO Detection')
+    global GLOBAL_WINDOW_OVERLAY
+    parser = argparse.ArgumentParser(description='Foresight YOLO Detection')
     parser.add_argument('--source', default='screen', help='Source: screen, camera, window, or file path')
     parser.add_argument('--camera', type=int, default=0, help='Camera index')
     parser.add_argument('--region', default=None, help='Screen region: x,y,width,height')
-    parser.add_argument('--window-title', default='Argus Phone Mirror', help='Window title to capture')
+    parser.add_argument('--window-title', default='Foresight Phone Mirror', help='Window title to capture')
     parser.add_argument('--output', default=None, help='Output video file path')
     parser.add_argument('--show', action='store_true', help='Display detection window')
     parser.add_argument('--yolo-scrcpy-mode', action='store_true', help='YOLO scrcpy window mode')
     parser.add_argument('--overlay', action='store_true', help='Draw detections directly on target window')
+    parser.add_argument('--face-save-dir', default=None, help='Directory to save verified face crops')
+    parser.add_argument('--enable-face-save', action='store_true', help='Enable capturing 5 crops and DeepFace verification')
     # Fallback detection removed - using pure YOLO only
     
     args = parser.parse_args()
@@ -1430,6 +2377,8 @@ def main():
     
     # Initialize detector
     detector = YOLODetector(use_fallback=False)
+    if args.face_save_dir and args.enable_face_save:
+        detector.set_face_save_dir(args.face_save_dir, enable=True)
     
     # Initialize capture
     if getattr(args, 'yolo_scrcpy_mode', False):
@@ -1449,16 +2398,29 @@ def main():
         capture = None
         cap = None
         print(f"[INFO] Window capture mode - targeting '{args.window_title}'")
-        
-        # Initialize overlay if requested
+
+        # Wait for the target window to appear (scrcpy may take a moment)
+        wait_start = time.time()
+        wait_timeout = 30.0  # seconds
+        while not window_capture.find_window():
+            if time.time() - wait_start > wait_timeout:
+                print(f"[WARNING] Window '{args.window_title}' not found within {int(wait_timeout)}s; waiting aborted")
+                break
+            print(f"[INFO] Waiting for '{args.window_title}' window...")
+            time.sleep(0.5)
+
+        # Initialize overlay if requested (after window is confirmed)
         window_overlay = None
         if args.overlay:
             window_overlay = WindowOverlay(args.window_title)
             if window_overlay.find_window():
                 print(f"[INFO] Overlay mode enabled for '{args.window_title}'")
+                # Store global overlay reference for non-blocking loading indicator
+                GLOBAL_WINDOW_OVERLAY = window_overlay
             else:
                 print(f"[WARNING] Could not find window for overlay mode")
                 window_overlay = None
+                GLOBAL_WINDOW_OVERLAY = None
     else:
         cap = cv2.VideoCapture(args.source if args.source != 'camera' else args.camera)
         capture = None
@@ -1484,7 +2446,9 @@ def main():
             elif window_capture:  # Window capture
                 frame = window_capture.capture_window()
                 if frame is None:
-                    break
+                    # If capture fails (window not found or invalid handle), retry instead of exiting
+                    time.sleep(0.2)
+                    continue
             else:  # Camera/video capture
                 ret, frame = cap.read()
                 if not ret:
@@ -1493,19 +2457,61 @@ def main():
             # ULTRA-HIGH FREQUENCY: No frame skipping - detect EVERY millisecond
             # Get stabilized detections and annotated frame - IMMEDIATE PROCESSING
             frame_with_detections, stabilized_detections = detector.detect_and_draw_simple_with_data(frame.copy())
+
+            # Per-track 5-frame face pipeline: process person detections
+            try:
+                if stabilized_detections:
+                    seen_tids = set()
+                    for d in stabilized_detections:
+                        if detector._is_person_detection(d):
+                            bbox = detector._bbox_from_detection(d)
+                            if bbox:
+                                tid, _ = detector._assign_or_create_track(bbox)
+                                seen_tids.add(tid)
+                                detector._on_detection(tid, frame, bbox)
+                                # Diagnostic: also force constant track_id=1 for testing
+                                try:
+                                    detector.on_detection(1, frame, bbox)
+                                except Exception as e:
+                                    print(f"{LOG_PREFIX} [on_detection ERROR] {e}", flush=True)
+                    # Reset counters for tracks not seen to enforce consecutiveness
+                    try:
+                        detector._init_foresight_tracking()
+                        for tid in list(detector.fs_frames_seen.keys()):
+                            if tid not in seen_tids:
+                                detector.fs_frames_seen[tid] = 0
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"{LOG_PREFIX}[PIPELINE]err:{e}", flush=True)
             
             # For overlay mode, use the same stabilized detections for window overlay
             if window_overlay and stabilized_detections:
-                # Convert stabilized format for overlay drawing
+                # Convert detections to overlay format, supporting both stabilized and simple data outputs
                 overlay_detections = []
                 for d in stabilized_detections:
-                    x1, y1, x2, y2 = map(int, d['coords'])
-                    overlay_detections.append({
-                    'box': [x1, y1, x2-x1, y2-y1],  # Convert to x,y,w,h format
-                    'label': detector.get_class_name(d['cls']),
-                    'confidence': d['conf'],
-                    'class_id': d['cls']
-                })
+                    try:
+                        if 'coords' in d:  # stabilized format
+                            x1, y1, x2, y2 = map(int, d['coords'])
+                            label = detector.get_class_name(d.get('cls', 0))
+                            confidence = float(d.get('conf', d.get('confidence', 0.0)))
+                            class_id = int(d.get('cls', 0))
+                        else:  # simple format from detect_and_draw_simple_with_data
+                            x1 = int(d.get('x1', 0)); y1 = int(d.get('y1', 0))
+                            x2 = int(d.get('x2', 0)); y2 = int(d.get('y2', 0))
+                            label = d.get('class', 'person')
+                            confidence = float(d.get('confidence', 0.0))
+                            # YOLO person class
+                            class_id = 0
+                        overlay_detections.append({
+                            'box': [x1, y1, max(0, x2 - x1), max(0, y2 - y1)],
+                            'label': label,
+                            'confidence': confidence,
+                            'class_id': class_id
+                        })
+                    except Exception:
+                        # Skip malformed detection entries
+                        continue
                 if overlay_detections:
                     detection_summary = ", ".join([f"{d['label']}({d['confidence']:.2f})" for d in overlay_detections])
                     # Removed detection logging to clean up interface
@@ -1517,7 +2523,7 @@ def main():
             
             # Display if requested or in yolo-scrcpy-mode (but not if overlay mode)
             if (args.show or getattr(args, 'yolo_scrcpy_mode', False)) and not args.overlay:
-                cv2.imshow('Argus SAR Detection', frame_with_detections)
+                cv2.imshow('Foresight SAR Detection', frame_with_detections)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
             elif args.overlay:
@@ -1538,6 +2544,8 @@ def main():
             out.release()
         if window_overlay:
             window_overlay.cleanup()
+        # Clear global overlay reference
+        GLOBAL_WINDOW_OVERLAY = None
         cv2.destroyAllWindows()
         print("[INFO] SAR detection terminated")
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Argus - Optimized YOLO Detection Script
+Foresight - Optimized YOLO Detection Script
 Implements ChatGPT's recommendations to eliminate flicker:
 1. Module-level model initialization
 2. model.track() with persistence

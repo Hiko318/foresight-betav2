@@ -1,8 +1,9 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
 const { spawn, exec } = require('child_process');
+const { initDetectionDatabase, logDetection, getRecentDetections, closeDetectionDatabase } = require('./db');
 
-class ArgusApp {
+class ForesightApp {
   constructor() {
     this.mainWindow = null;
     this.scrcpyWindow = null;
@@ -11,6 +12,8 @@ class ArgusApp {
     this.scrcpyProcess = null;
     this.isCapturing = false;
     this.sarModeEnabled = false;
+    this.detectionLoggingEnabled = false;
+    this.faceSaveDir = null; // User-configurable save folder for verified faces
     this.childWindows = [];
     this.scrcpyWindowState = 'normal'; // Track scrcpy window state: 'normal', 'minimized', 'hidden'
     this.mainWindowState = 'normal'; // Track main window state
@@ -30,7 +33,7 @@ class ArgusApp {
         backgroundThrottling: false  // ChatGPT recommendation #7: Disable background throttling
       },
       icon: path.join(__dirname, '../assets/icon.png'),
-      title: 'Argus',
+      title: 'Foresight',
       resizable: true,
       minimizable: true,
       maximizable: true,
@@ -154,7 +157,7 @@ class ArgusApp {
         $found = $false
         
         foreach ($proc in $processes) {
-          if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
+          if ($proc.MainWindowTitle -eq "Foresight Phone Mirror") {
             $found = $true
             Add-Type -TypeDefinition '
               using System;
@@ -243,7 +246,7 @@ class ArgusApp {
          $found = $false
          
          foreach ($proc in $processes) {
-           if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
+           if ($proc.MainWindowTitle -eq "Foresight Phone Mirror") {
              $found = $true
              Add-Type -TypeDefinition '
                using System;
@@ -278,7 +281,7 @@ class ArgusApp {
              Start-Sleep -Milliseconds 300
              
              # Reposition to layer 2 after restore
-             $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Argus"} | Select-Object -First 1
+             $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Foresight"} | Select-Object -First 1
              if ($mainWindow) {
                [Win32API]::SetWindowPos($proc.MainWindowHandle, $mainWindow.MainWindowHandle, 1, 128, 1498, 937, 0x0040)
              } else {
@@ -332,7 +335,7 @@ class ArgusApp {
     // Alternative minimize method using different approach
     const psCommand = `
       Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($_.MainWindowTitle -eq "Argus Phone Mirror") {
+        if ($_.MainWindowTitle -eq "Foresight Phone Mirror") {
           $_.CloseMainWindow()
           Write-Host "Fallback minimize attempted"
         }
@@ -436,7 +439,7 @@ class ArgusApp {
       $processes = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue
       
       foreach ($proc in $processes) {
-        if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
+        if ($proc.MainWindowTitle -eq "Foresight Phone Mirror") {
           Add-Type -TypeDefinition '
             using System;
             using System.Runtime.InteropServices;
@@ -491,7 +494,7 @@ class ArgusApp {
     const psCommand = `
       Add-Type -AssemblyName System.Windows.Forms
       $processes = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue
-      $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Argus"} | Select-Object -First 1
+      $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Foresight"} | Select-Object -First 1
       
       foreach ($proc in $processes) {
         if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
@@ -538,10 +541,10 @@ class ArgusApp {
       const psCommand = `
         Add-Type -AssemblyName System.Windows.Forms
         $processes = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue
-        $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Argus"} | Select-Object -First 1
+        $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Foresight"} | Select-Object -First 1
         
         foreach ($proc in $processes) {
-          if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
+          if ($proc.MainWindowTitle -eq "Foresight Phone Mirror") {
             Add-Type -TypeDefinition '
               using System;
               using System.Runtime.InteropServices;
@@ -602,7 +605,7 @@ class ArgusApp {
       Add-Type -AssemblyName System.Windows.Forms
       $processes = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue
       foreach ($proc in $processes) {
-        if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
+        if ($proc.MainWindowTitle -eq "Foresight Phone Mirror") {
           Add-Type -TypeDefinition '
             using System;
             using System.Runtime.InteropServices;
@@ -687,7 +690,8 @@ class ArgusApp {
       }
       
       // Device found, start scrcpy
-      this.mainWindow.webContents.send('console-log', `Device detected: ${devices[0].split('\t')[0]}`);
+      const deviceId = devices[0].split('\t')[0];
+      this.mainWindow.webContents.send('console-log', `Device detected: ${deviceId}`);
       this.mainWindow.webContents.send('console-log', 'Starting screen mirror...');
       
       this.isCapturing = true;
@@ -702,7 +706,8 @@ class ArgusApp {
       
       // Start scrcpy process with calculated position and VSync settings
       this.scrcpyProcess = spawn('scrcpy', [
-        '--window-title=Argus Phone Mirror',
+        '-s', deviceId,
+        '--window-title=Foresight Phone Mirror',
         `--window-x=${scrcpyX}`,
         `--window-y=${scrcpyY}`,
         `--window-width=${winWidth}`,
@@ -717,6 +722,18 @@ class ArgusApp {
       setTimeout(() => {
         this.setupWindowTracking();
       }, 2000);
+
+      // Forward scrcpy logs for easier diagnostics
+      if (this.scrcpyProcess.stdout) {
+        this.scrcpyProcess.stdout.on('data', (data) => {
+          this.mainWindow.webContents.send('console-log', `scrcpy: ${data.toString()}`);
+        });
+      }
+      if (this.scrcpyProcess.stderr) {
+        this.scrcpyProcess.stderr.on('data', (data) => {
+          this.mainWindow.webContents.send('console-log', `scrcpy error: ${data.toString()}`);
+        });
+      }
 
       this.scrcpyProcess.on('error', (error) => {
         console.error('Scrcpy error:', error);
@@ -797,8 +814,8 @@ class ArgusApp {
     console.log('Starting YOLO scrcpy window...');
     this.mainWindow.webContents.send('console-log', 'Starting YOLO scrcpy window...');
     
-    console.log('SAR mode will capture Argus Phone Mirror window content');
-    this.mainWindow.webContents.send('console-log', 'SAR mode capturing window: Argus Phone Mirror');
+    console.log('SAR mode will capture Foresight Phone Mirror window content');
+    this.mainWindow.webContents.send('console-log', 'SAR mode capturing window: Foresight Phone Mirror');
     
     // First, start scrcpy if not already running
     if (!this.scrcpyProcess) {
@@ -811,7 +828,7 @@ class ArgusApp {
       const scrcpyY = 128;
       
       this.scrcpyProcess = spawn('scrcpy', [
-        '--window-title=Argus Phone Mirror',
+        '--window-title=Foresight Phone Mirror',
         `--window-x=${scrcpyX}`,
         `--window-y=${scrcpyY}`,
         `--window-width=${winWidth}`,
@@ -855,69 +872,125 @@ class ArgusApp {
     }
     
     // Wait for scrcpy window to be created, then start YOLO
-     setTimeout(() => {
-       const scriptPath = path.join(__dirname, '../scripts/yolo_detection.py');
-       console.log(`Starting YOLO with script: ${scriptPath}`);
-       this.mainWindow.webContents.send('console-log', `Starting YOLO with script: ${scriptPath}`);
-       
-       // Start YOLO without overlay flag - we'll use Electron overlay instead
-       this.yoloProcess = spawn('python', [
-         scriptPath,
-         '--source=window',
-         '--window-title=Argus Phone Mirror'
-       ], {
-         cwd: path.join(__dirname, '..'),
-         stdio: ['pipe', 'pipe', 'pipe']
-       });
-       
-       // Parse YOLO detection data and send to overlay
-       this.yoloProcess.stdout.on('data', (data) => {
-         const output = data.toString();
-         console.log(`YOLO stdout: ${output}`);
-         
-         // Parse detection data from YOLO output
-         try {
-           const lines = output.split('\n');
-           for (const line of lines) {
-             if (line.includes('DETECTION_DATA:')) {
-               const detectionData = JSON.parse(line.replace('DETECTION_DATA:', ''));
-               // Send detection data to overlay window
-               if (this.overlayWindow) {
-                 this.overlayWindow.webContents.send('yolo-detections', detectionData);
-               }
-             }
-           }
-         } catch (e) {
-           // Ignore parsing errors for non-JSON output
-         }
-         
-         // Only send important messages to UI, not debug spam
-         if (output.includes('[ERROR]') || output.includes('YOLO model initialized')) {
-           this.mainWindow.webContents.send('console-log', `YOLO: ${output.trim()}`);
-         }
-       });
-        
-        // Log YOLO stderr for debugging (console only, not UI)
-        this.yoloProcess.stderr.on('data', (data) => {
-          const output = data.toString();
-          console.error(`YOLO stderr: ${output}`);
-          // Only send actual errors to UI
-          this.mainWindow.webContents.send('console-log', `YOLO Error: ${output.trim()}`);
+    setTimeout(() => {
+      const scriptPath = path.join(__dirname, '../scripts/yolo_detection.py');
+      console.log(`Starting YOLO with script: ${scriptPath}`);
+      this.mainWindow.webContents.send('console-log', `Starting YOLO with script: ${scriptPath}`);
+
+      const workingDir = path.join(__dirname, '..');
+      const baseArgs = [
+        scriptPath,
+        '--source=window',
+        '--window-title=Foresight Phone Mirror'
+      ];
+
+      // Pass face save configuration to YOLO
+      if (this.faceSaveDir) {
+        baseArgs.push('--enable-face-save');
+        baseArgs.push(`--face-save-dir=${this.faceSaveDir}`);
+      }
+
+      // Attach logging from a process to UI
+      const attachYoloLogs = (proc) => {
+        if (proc.stdout) {
+          proc.stdout.on('data', (data) => {
+            const output = data.toString();
+            console.log(`YOLO stdout: ${output}`);
+            try {
+              const lines = output.split('\n');
+              for (const line of lines) {
+                if (line.includes('DETECTION_DATA:')) {
+                  const detectionData = JSON.parse(line.replace('DETECTION_DATA:', ''));
+                  if (this.overlayWindow) {
+                    this.overlayWindow.webContents.send('yolo-detections', detectionData);
+                  }
+                  // Conditionally log detection type to SQLite
+                  if (this.detectionLoggingEnabled) {
+                    try {
+                      let detectionType = 'unknown';
+                      if (Array.isArray(detectionData)) {
+                        const first = detectionData[0] || {};
+                        detectionType = first.type || first.label || 'unknown';
+                      } else if (typeof detectionData === 'object' && detectionData) {
+                        detectionType = detectionData.type || detectionData.label || 'unknown';
+                      }
+                      logDetection(detectionType);
+                      // Announce to renderer for live updates
+                      this.mainWindow && this.mainWindow.webContents.send('detection-logged', {
+                        type: detectionType,
+                        timestamp: new Date().toISOString()
+                      });
+                    } catch (_) {}
+                  }
+                } else if (line.startsWith('FACE_SAVED:')) {
+                  const savedPath = line.replace('FACE_SAVED:', '').trim();
+                  this.mainWindow && this.mainWindow.webContents.send('console-log', `Face saved: ${savedPath}`);
+                  this.mainWindow && this.mainWindow.webContents.send('face-saved', { path: savedPath, timestamp: new Date().toISOString() });
+                }
+              }
+            } catch (_) {}
+            // Forward YOLO info and error logs to console
+            if (output.includes('[ERROR]') || output.includes('YOLO model initialized')) {
+              this.mainWindow.webContents.send('console-log', `YOLO: ${output.trim()}`);
+            }
+          });
+        }
+        if (proc.stderr) {
+          proc.stderr.on('data', (data) => {
+            const output = data.toString();
+            console.error(`YOLO stderr: ${output}`);
+            this.mainWindow.webContents.send('console-log', `YOLO Error: ${output.trim()}`);
+          });
+        }
+      };
+
+      // Prefer Python 3.9 explicitly to avoid TF/Keras version issues
+      // Remove generic 'python' fallback; try 'py -3.9' then 'py -3'
+      const interpreters = [
+        { label: 'py -3.9', cmd: 'py', argsPrefix: ['-3.9'] },
+        { label: 'py -3', cmd: 'py', argsPrefix: ['-3'] }
+      ];
+
+      const attemptInterpreter = (index) => {
+        if (index >= interpreters.length) {
+          this.mainWindow.webContents.send('console-log', 'YOLO failed to start with all interpreters');
+          this.sarModeEnabled = false;
+          this.mainWindow.webContents.send('sar-stopped');
+          return;
+        }
+
+        const { label, cmd, argsPrefix } = interpreters[index];
+        const args = [...argsPrefix, ...baseArgs];
+        this.mainWindow.webContents.send('console-log', `Using Python interpreter: ${label}`);
+
+        const proc = spawn(cmd, args, { cwd: workingDir, stdio: ['pipe', 'pipe', 'pipe'] });
+        this.yoloProcess = proc;
+        attachYoloLogs(proc);
+
+        let attemptedFallback = false;
+
+        proc.on('error', (error) => {
+          console.error(`YOLO spawn error with ${label}:`, error);
+          this.mainWindow.webContents.send('console-log', `YOLO spawn error with ${label}: ${error.message}`);
+          if (!attemptedFallback) {
+            attemptedFallback = true;
+            attemptInterpreter(index + 1);
+          }
         });
-       
-       this.yoloProcess.on('error', (error) => {
-         console.error('YOLO spawn error:', error);
-         this.mainWindow.webContents.send('console-log', `YOLO spawn error: ${error.message}`);
-         this.mainWindow.webContents.send('sar-error', error.message);
-       });
-       
-       this.yoloProcess.on('close', (code) => {
-         console.log(`YOLO process exited with code ${code}`);
-         this.mainWindow.webContents.send('console-log', `YOLO process exited with code ${code}`);
-         this.sarModeEnabled = false;
-         this.mainWindow.webContents.send('sar-stopped');
-       });
-     }, 3000);
+
+        proc.on('close', (code) => {
+          const shouldFallback = code !== 0; // 103 from py means version missing
+          console.log(`YOLO process with ${label} exited with code ${code}`);
+          this.mainWindow.webContents.send('console-log', `YOLO process with ${label} exited with code ${code}`);
+          if (shouldFallback && !attemptedFallback) {
+            attemptedFallback = true;
+            attemptInterpreter(index + 1);
+          }
+        });
+      };
+
+      attemptInterpreter(0);
+    }, 3000);
 
     this.mainWindow.webContents.send('sar-started');
   }
@@ -988,7 +1061,7 @@ class ArgusApp {
       
       foreach ($proc in $processes) {
         $windows = $proc.MainWindowTitle
-        if ($windows -like "*Argus SAR Detection*" -or $windows -eq "Argus SAR Detection") {
+        if ($windows -like "*Foresight SAR Detection*" -or $windows -eq "Foresight SAR Detection") {
           Add-Type -TypeDefinition '
             using System;
             using System.Runtime.InteropServices;
@@ -1133,41 +1206,126 @@ class ArgusApp {
     ipcMain.on('get-status', (event) => {
       event.reply('status-update', {
         isCapturing: this.isCapturing,
-        sarModeEnabled: this.sarModeEnabled
+        sarModeEnabled: this.sarModeEnabled,
+        detectionLoggingEnabled: this.detectionLoggingEnabled
       });
     });
 
     ipcMain.on('update-yolo-region', (event, coordinates) => {
       this.updateYOLORegion(coordinates);
     });
+
+    // Toggle detection logging to SQLite
+    ipcMain.on('set-detection-logging', (event, enabled) => {
+      this.detectionLoggingEnabled = !!enabled;
+      event.reply('status-update', {
+        isCapturing: this.isCapturing,
+        sarModeEnabled: this.sarModeEnabled,
+        detectionLoggingEnabled: this.detectionLoggingEnabled
+      });
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `Detection logging ${this.detectionLoggingEnabled ? 'enabled' : 'disabled'}`);
+    });
+
+    // Provide recent detection logs to renderer
+    ipcMain.on('get-detection-logs', (event, limit = 50) => {
+      try {
+        const rows = getRecentDetections(limit);
+        event.reply('detection-logs', rows);
+      } catch (err) {
+        event.reply('detection-logs', []);
+      }
+    });
+
+    // Face save directory settings
+    ipcMain.on('get-face-save-dir', (event) => {
+      event.reply('face-save-dir', this.faceSaveDir || null);
+    });
+    ipcMain.on('choose-face-save-dir', async (event) => {
+      try {
+        const res = await dialog.showOpenDialog(this.mainWindow, {
+          properties: ['openDirectory', 'createDirectory']
+        });
+        if (!res.canceled && res.filePaths && res.filePaths[0]) {
+          this.faceSaveDir = res.filePaths[0];
+          this.saveFaceSaveSettings();
+          event.reply('face-save-dir', this.faceSaveDir);
+          this.mainWindow && this.mainWindow.webContents.send('console-log', `Face save folder set to: ${this.faceSaveDir}`);
+        }
+      } catch (e) {
+        this.mainWindow && this.mainWindow.webContents.send('console-log', `Folder selection failed: ${e.message}`);
+      }
+    });
+    ipcMain.on('set-face-save-dir', (event, dirPath) => {
+      try {
+        if (dirPath) {
+          this.faceSaveDir = dirPath;
+          this.saveFaceSaveSettings();
+          event.reply('face-save-dir', this.faceSaveDir);
+          this.mainWindow && this.mainWindow.webContents.send('console-log', `Face save folder set to: ${this.faceSaveDir}`);
+        }
+      } catch (e) {
+        this.mainWindow && this.mainWindow.webContents.send('console-log', `Failed to set folder: ${e.message}`);
+      }
+    });
+  }
+
+  loadFaceSaveSettings() {
+    const fs = require('fs');
+    const settingsPath = path.join(app.getPath('userData'), 'face_settings.json');
+    try {
+      if (fs.existsSync(settingsPath)) {
+        const data = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+        if (data && data.faceSaveDir) {
+          this.faceSaveDir = data.faceSaveDir;
+          this.mainWindow && this.mainWindow.webContents.send('console-log', `Face save folder loaded: ${this.faceSaveDir}`);
+        }
+      }
+    } catch (e) {
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `Failed to load face settings: ${e.message}`);
+    }
+  }
+
+  saveFaceSaveSettings() {
+    const fs = require('fs');
+    const settingsPath = path.join(app.getPath('userData'), 'face_settings.json');
+    try {
+      fs.writeFileSync(settingsPath, JSON.stringify({ faceSaveDir: this.faceSaveDir }, null, 2));
+    } catch (e) {
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `Failed to save face settings: ${e.message}`);
+    }
   }
 }
 
 // App initialization
-console.log('Initializing Argus App...');
-const argusApp = new ArgusApp();
+console.log('Initializing Foresight App...');
+const foresightApp = new ForesightApp();
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  const { dbPath } = await initDetectionDatabase();
+  console.log(`Detection database initialized at: ${dbPath}`);
   console.log('Electron app ready - creating main window...');
-  argusApp.createMainWindow();
-  argusApp.setupIpcHandlers();
+  foresightApp.createMainWindow();
+  foresightApp.setupIpcHandlers();
+  // Load face save settings after window is ready
+  foresightApp.loadFaceSaveSettings();
   console.log('App initialization complete');
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       console.log('App activated - creating new window...');
-      argusApp.createMainWindow();
+      foresightApp.createMainWindow();
     }
   });
 });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
-    argusApp.cleanup();
+    foresightApp.cleanup();
     app.quit();
   }
 });
 
 app.on('before-quit', () => {
-  argusApp.cleanup();
+  foresightApp.cleanup();
+  closeDetectionDatabase();
 });

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Argus</title>
+    <title>Foresight</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -12,7 +12,7 @@
         <header class="header">
             <div class="logo">
                 <div class="logo-icon">🔮</div>
-                <h1>ARGUS</h1>
+                <h1>FORESIGHT</h1>
             </div>
             <div class="header-controls">
                 <button id="startCapture" class="btn btn-success">Start Capture</button>
@@ -25,6 +25,14 @@
                         <label for="sarMode" class="toggle-slider"></label>
                     </div>
                     <span id="sarStatus" class="status-text">Disabled</span>
+                </div>
+                <div class="sar-toggle">
+                    <label class="toggle-label">Log Detections</label>
+                    <div class="toggle-switch">
+                        <input type="checkbox" id="dbLogging" class="toggle-input">
+                        <label for="dbLogging" class="toggle-slider"></label>
+                    </div>
+                    <span id="dbLogStatus" class="status-text">Disabled</span>
                 </div>
             </div>
         </header>
@@ -50,13 +58,31 @@
                 </div>
             </div>
 
-            <!-- Console Panel (moved to right side) -->
+            <!-- Right Side Panel: Detection Logs Dropdown (replaces Console Output) -->
             <div class="console-panel-right">
                 <div class="console-header">
                     <h4>Console Output</h4>
                     <button id="clearConsole" class="btn btn-small">Clear</button>
                 </div>
                 <div id="consoleOutput" class="console-content"></div>
+
+                <div class="face-save-controls">
+                    <div class="face-save-header">
+                        <h4>Face Save Folder</h4>
+                        <button id="chooseFaceFolder" class="btn btn-small">Choose</button>
+                    </div>
+                    <div id="faceSavePath" class="face-save-path">Not set</div>
+                </div>
+
+                <div id="detectionLogPanel" class="slide-panel collapsed">
+                    <div class="slide-header">
+                        <h4>Detection Logs</h4>
+                        <div class="slide-actions">
+                            <button id="refreshDetections" class="btn btn-small">Refresh</button>
+                        </div>
+                    </div>
+                    <div id="detectionLogList" class="slide-content"></div>
+                </div>
             </div>
         </main>
     </div>
